@@ -81,7 +81,9 @@ def smooth_diffusion_qkv_proj(
         )
         if prevs is None:
             # we need to register forward pre hook to smooth inputs
-            if attn.module.group_norm is None and attn.module.spatial_norm is None:
+            group_norm = getattr(attn.module, "group_norm", None)
+            spatial_norm = getattr(attn.module, "spatial_norm", None)
+            if group_norm is None and spatial_norm is None:
                 ActivationSmoother(
                     smooth_cache[cache_key],
                     channels_dim=-1,
