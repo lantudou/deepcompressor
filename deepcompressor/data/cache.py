@@ -81,7 +81,7 @@ class TensorCache:
     """
 
     data: list[torch.Tensor] = field(default_factory=list)
-    channels_dim: int = 1
+    channels_dim: int | None = None
     reshape: ReshapeFn = ReshapeFn()
 
     num_cached: int = 0

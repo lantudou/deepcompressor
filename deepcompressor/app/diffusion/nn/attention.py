@@ -13,6 +13,15 @@ from diffusers.models.attention_processor import (
     JointAttnProcessor2_0,
 )
 
+try:
+    from diffusers.models.transformers.transformer_qwenimage import (
+        QwenDoubleStreamAttnProcessor2_0,
+        apply_rotary_emb_qwen,
+    )
+except ImportError:
+    QwenDoubleStreamAttnProcessor2_0 = None
+    apply_rotary_emb_qwen = None
+
 from deepcompressor.nn.patch.sdpa import ScaleDotProductAttention
 
 __all__ = ["DiffusionAttentionProcessor"]
@@ -33,13 +42,16 @@ else:
 class DiffusionAttentionProcessor(nn.Module):
     def __init__(
         self,
-        orig: AttnProcessor2_0 | FluxAttnProcessor2_0 | JointAttnProcessor2_0,
+        orig: AttnProcessor2_0 | FluxAttnProcessor2_0 | JointAttnProcessor2_0 | tp.Any,
         sdpa: ScaleDotProductAttention | None = None,
     ) -> None:
         super().__init__()
         self.orig = orig
         if orig.__class__.__name__.startswith("Flux"):
             self.rope = apply_flux_rope
+        elif QwenDoubleStreamAttnProcessor2_0 is not None and isinstance(orig, QwenDoubleStreamAttnProcessor2_0):
+            # QwenDoubleStreamAttnProcessor2_0 uses its own RoPE implementation
+            self.rope = "qwen"
         elif isinstance(orig, (AttnProcessor2_0, JointAttnProcessor2_0)):
             self.rope = None
         else:
@@ -129,6 +141,20 @@ class DiffusionAttentionProcessor(nn.Module):
             add_query = attn.norm_added_q(add_query)
             add_key = attn.norm_added_k(add_key)
 
+        # Apply RoPE before concatenation for Qwen, after concatenation for others
+        if image_rotary_emb is not None and self.rope == "qwen":
+            # Qwen applies RoPE separately to each stream before concatenation
+            # Qwen's apply_rotary_emb expects [batch, seq, heads, head_dim]
+            # but we have [batch, heads, seq, head_dim] after transpose
+            img_freqs, txt_freqs = image_rotary_emb
+            query = apply_rotary_emb_qwen(query.transpose(1, 2), img_freqs, use_real=False).transpose(1, 2)
+            if key is not None:
+                key = apply_rotary_emb_qwen(key.transpose(1, 2), img_freqs, use_real=False).transpose(1, 2)
+            if add_query is not None:
+                add_query = apply_rotary_emb_qwen(add_query.transpose(1, 2), txt_freqs, use_real=False).transpose(1, 2)
+            if add_key is not None:
+                add_key = apply_rotary_emb_qwen(add_key.transpose(1, 2), txt_freqs, use_real=False).transpose(1, 2)
+
         if add_query is not None:
             query = torch.cat([add_query, query], dim=2)
         if add_key is not None:
@@ -139,7 +165,8 @@ class DiffusionAttentionProcessor(nn.Module):
                 value = torch.cat([add_value, value], dim=2)
         del add_query, add_key, add_value
 
-        if image_rotary_emb is not None:
+        # Apply RoPE after concatenation for Flux and others
+        if image_rotary_emb is not None and self.rope != "qwen" and self.rope is not None:
             query, key = self.rope(query, key, image_rotary_emb)
 
         hidden_states = self.sdpa(query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False)

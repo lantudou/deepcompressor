@@ -7,7 +7,7 @@ import safetensors.torch
 import torch
 import tqdm
 
-from .utils import convert_to_nunchaku_w4x4y16_linear_weight, convert_to_nunchaku_w4x16_linear_weight
+from deepcompressor.backend.nunchaku.utils import convert_to_nunchaku_w4x4y16_linear_weight, convert_to_nunchaku_w4x16_linear_weight
 
 
 def convert_to_nunchaku_w4x4y16_linear_state_dict(
@@ -64,11 +64,11 @@ def convert_to_nunchaku_w4x4y16_linear_state_dict(
     if subscale is not None:
         state_dict[subscale_key] = subscale
     state_dict["bias"] = bias
-    state_dict["smooth_orig"] = smooth
-    state_dict["smooth"] = torch.ones_like(smooth) if smooth_fused else smooth.clone()
+    state_dict["smooth_factor_orig"] = smooth
+    state_dict["smooth_factor"] = torch.ones_like(smooth) if smooth_fused else smooth.clone()
     if lora is not None:
-        state_dict["lora_down"] = lora[0]
-        state_dict["lora_up"] = lora[1]
+        state_dict["proj_down"] = lora[0]
+        state_dict["proj_up"] = lora[1]
     return state_dict
 
 
@@ -99,6 +99,27 @@ def convert_to_nunchaku_w4x16_adanorm_zero_state_dict(
     )
     state_dict: dict[str, torch.Tensor] = {}
     state_dict = {}
+    state_dict["qweight"] = weight
+    state_dict["wscales"] = scale
+    state_dict["wzeros"] = zero
+    state_dict["bias"] = bias
+    return state_dict
+
+
+def convert_to_nunchaku_w4x16_adanorm_mod_state_dict(
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    bias: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    """Convert QwenImage modulation layer (img_mod[1] or txt_mod[1]) to Nunchaku format.
+
+    QwenImage uses 6 modulation parameters (shift1, scale1, gate1, shift2, scale2, gate2)
+    which is the same split count as adanorm_zero.
+    """
+    weight, scale, zero, bias = convert_to_nunchaku_w4x16_linear_weight(
+        weight, scale=scale, bias=bias, adanorm_splits=6
+    )
+    state_dict: dict[str, torch.Tensor] = {}
     state_dict["qweight"] = weight
     state_dict["wscales"] = scale
     state_dict["wzeros"] = zero
@@ -189,11 +210,28 @@ def convert_to_nunchaku_transformer_block_state_dict(
                 convert_to_nunchaku_w4x16_adanorm_zero_state_dict(weight=weight, scale=scale, bias=bias),
                 prefix=converted_local_name,
             )
+        elif convert_map[converted_local_name] == "adanorm_mod":
+            print(f"  - Converting {block_name} weights of {candidate_local_names} to {converted_local_name}.")
+            update_state_dict(
+                converted,
+                convert_to_nunchaku_w4x16_adanorm_mod_state_dict(weight=weight, scale=scale, bias=bias),
+                prefix=converted_local_name,
+            )
         elif convert_map[converted_local_name] == "linear":
             smooth_fused = "out_proj" in converted_local_name and smooth_dict.get("proj.fuse_when_possible", True)
-            shift = [candidates.get(f"{candidate_name[:-7]}.shift", None) for candidate_name in candidate_names]
-            assert all(s == shift[0] for s in shift)
-            shift = shift[0]
+            # Try to find shift key - handle cases like "img_mlp.net.2.linear.weight" where shift is at "img_mlp.net.2.shift"
+            shift_list = []
+            for candidate_name in candidate_names:
+                base_name = candidate_name[:-7]  # Remove ".weight"
+                shift_val = candidates.get(f"{base_name}.shift", None)
+                if shift_val is None:
+                    # Try removing ".linear" suffix if present (e.g., for QwenImage MLP down proj)
+                    if base_name.endswith(".linear"):
+                        alt_base = base_name[:-7]  # Remove ".linear"
+                        shift_val = candidates.get(f"{alt_base}.shift", None)
+                shift_list.append(shift_val)
+            assert all(s == shift_list[0] for s in shift_list), f"Inconsistent shift values: {shift_list}"
+            shift = shift_list[0]
             print(
                 f"  - Converting {block_name} weights of {candidate_local_names} to {converted_local_name}."
                 f" (smooth_fused={smooth_fused}, shifted={shift is not None}, float_point={float_point})"
@@ -380,11 +418,184 @@ def convert_to_nunchaku_flux_state_dicts(
     return converted, other
 
 
+def convert_to_nunchaku_qwenimage_transformer_block_state_dict(
+    state_dict: dict[str, torch.Tensor],
+    scale_dict: dict[str, torch.Tensor],
+    smooth_dict: dict[str, torch.Tensor],
+    branch_dict: dict[str, torch.Tensor],
+    block_name: str,
+    float_point: bool = False,
+) -> dict[str, torch.Tensor]:
+    """Convert a QwenImage transformer block to Nunchaku format.
+
+    QwenImage dual-stream architecture layer mapping:
+    - img_mod[1] → mod (W4A16 modulation)
+    - txt_mod[1] → add_mod (W4A16 modulation)
+    - attn.to_q/to_k/to_v → qkv_proj (image stream)
+    - attn.add_q_proj/add_k_proj/add_v_proj → qkv_proj_context (text stream)
+    - attn.to_out[0] → out_proj (image output)
+    - attn.to_add_out → out_proj_context (text output)
+    - img_mlp.net.0.proj → mlp_fc1 (image MLP)
+    - img_mlp.net.2 → mlp_fc2 (image MLP)
+    - txt_mlp.net.0.proj → mlp_context_fc1 (text MLP)
+    - txt_mlp.net.2 → mlp_context_fc2 (text MLP)
+    """
+    # Handle potential .linear suffix variations in MLP down projections
+    img_down_proj_local_name = "img_mlp.net.2.linear"
+    if f"{block_name}.{img_down_proj_local_name}.weight" not in state_dict:
+        img_down_proj_local_name = "img_mlp.net.2"
+        assert f"{block_name}.{img_down_proj_local_name}.weight" in state_dict
+
+    txt_down_proj_local_name = "txt_mlp.net.2.linear"
+    if f"{block_name}.{txt_down_proj_local_name}.weight" not in state_dict:
+        txt_down_proj_local_name = "txt_mlp.net.2"
+        assert f"{block_name}.{txt_down_proj_local_name}.weight" in state_dict
+
+    return convert_to_nunchaku_transformer_block_state_dict(
+        state_dict=state_dict,
+        scale_dict=scale_dict,
+        smooth_dict=smooth_dict,
+        branch_dict=branch_dict,
+        block_name=block_name,
+        local_name_map={
+            # Modulation layers (W4A16) - keep original names for Nunchaku compatibility
+            "img_mod.1": "img_mod.1",
+            "txt_mod.1": "txt_mod.1",
+            # Attention QKV projections - merged to single layer
+            "attn.to_qkv": ["attn.to_q", "attn.to_k", "attn.to_v"],
+            "attn.add_qkv_proj": ["attn.add_q_proj", "attn.add_k_proj", "attn.add_v_proj"],
+            # Attention normalization layers (non-quantized, direct copy)
+            "attn.norm_q": "attn.norm_q",
+            "attn.norm_k": "attn.norm_k",
+            "attn.norm_added_q": "attn.norm_added_q",
+            "attn.norm_added_k": "attn.norm_added_k",
+            # Attention output projections
+            "attn.to_out.0": "attn.to_out.0",
+            "attn.to_add_out": "attn.to_add_out",
+            # Image MLP - keep original structure
+            "img_mlp.net.0.proj": "img_mlp.net.0.proj",
+            "img_mlp.net.2": img_down_proj_local_name,
+            # Text MLP - keep original structure
+            "txt_mlp.net.0.proj": "txt_mlp.net.0.proj",
+            "txt_mlp.net.2": txt_down_proj_local_name,
+        },
+        smooth_name_map={
+            "attn.to_qkv": "attn.to_q",
+            "attn.add_qkv_proj": "attn.add_k_proj",
+            "attn.to_out.0": "attn.to_out.0",
+            "attn.to_add_out": "attn.to_out.0",
+            "img_mlp.net.0.proj": "img_mlp.net.0.proj",
+            "img_mlp.net.2": img_down_proj_local_name,
+            "txt_mlp.net.0.proj": "txt_mlp.net.0.proj",
+            "txt_mlp.net.2": txt_down_proj_local_name,
+            "img_mod.1": "img_mod.1",
+            "txt_mod.1": "txt_mod.1",
+        },
+        branch_name_map={
+            "attn.to_qkv": "attn.to_q",
+            "attn.add_qkv_proj": "attn.add_k_proj",
+            "attn.to_out.0": "attn.to_out.0",
+            "attn.to_add_out": "attn.to_add_out",
+            "img_mlp.net.0.proj": "img_mlp.net.0.proj",
+            "img_mlp.net.2": img_down_proj_local_name,
+            "txt_mlp.net.0.proj": "txt_mlp.net.0.proj",
+            "txt_mlp.net.2": txt_down_proj_local_name,
+        },
+        convert_map={
+            # Modulation layers use adanorm_mod (W4A16 with 6 splits)
+            "img_mod.1": "adanorm_mod",
+            "txt_mod.1": "adanorm_mod",
+            # All other quantized layers use linear (W4A4)
+            "attn.to_qkv": "linear",
+            "attn.add_qkv_proj": "linear",
+            "attn.to_out.0": "linear",
+            "attn.to_add_out": "linear",
+            "img_mlp.net.0.proj": "linear",
+            "img_mlp.net.2": "linear",
+            "txt_mlp.net.0.proj": "linear",
+            "txt_mlp.net.2": "linear",
+        },
+        float_point=float_point,
+    )
+
+
+def convert_to_nunchaku_qwenimage_state_dicts(
+    state_dict: dict[str, torch.Tensor],
+    scale_dict: dict[str, torch.Tensor],
+    smooth_dict: dict[str, torch.Tensor],
+    branch_dict: dict[str, torch.Tensor],
+    float_point: bool = False,
+) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+    """Convert QwenImage model state dict to Nunchaku format.
+
+    QwenImage does NOT have single_transformer_blocks (unlike Flux).
+    All transformer blocks are dual-stream blocks.
+
+    Non-quantized layers (directly copied):
+    - img_in, txt_in: Input projections
+    - txt_norm: Text normalization (RMSNorm)
+    - time_text_embed: Timestep embedding
+    - pos_embed: Position encoding (RoPE)
+    - norm_out, proj_out: Output layers
+    - img_norm1, img_norm2, txt_norm1, txt_norm2: Block layer norms
+    - norm_q, norm_k, norm_added_q, norm_added_k: Attention QK norms
+    """
+    block_names: set[str] = set()
+    other: dict[str, torch.Tensor] = {}
+    for param_name in state_dict.keys():
+        # QwenImage only has transformer_blocks, no single_transformer_blocks
+        if param_name.startswith("transformer_blocks."):
+            block_names.add(".".join(param_name.split(".")[:2]))
+        else:
+            other[param_name] = state_dict[param_name]
+    block_names = sorted(block_names, key=lambda x: int(x.split(".")[-1]))
+    print(f"Converting {len(block_names)} QwenImage transformer blocks...")
+    converted: dict[str, torch.Tensor] = {}
+    for block_name in block_names:
+        update_state_dict(
+            converted,
+            convert_to_nunchaku_qwenimage_transformer_block_state_dict(
+                state_dict=state_dict,
+                scale_dict=scale_dict,
+                smooth_dict=smooth_dict,
+                branch_dict=branch_dict,
+                block_name=block_name,
+                float_point=float_point,
+            ),
+            prefix=block_name,
+        )
+    return converted, other
+
+
+def _detect_model_type(model_name: str) -> str:
+    """Detect the model type from the model name.
+
+    Args:
+        model_name: The model name string.
+
+    Returns:
+        The detected model type: "flux" or "qwenimage".
+
+    Raises:
+        ValueError: If the model type cannot be detected.
+    """
+    model_name_lower = model_name.lower().replace("-", "").replace("_", "")
+    if "qwenimage" in model_name_lower or "qwen2vl" in model_name_lower:
+        return "qwenimage"
+    elif "flux" in model_name_lower:
+        return "flux"
+    else:
+        raise ValueError(
+            f"Cannot detect model type from model name '{model_name}'. "
+            "Supported model types: 'flux', 'qwenimage' (or 'qwen-image', 'qwen2vl')."
+        )
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--quant-path", type=str, required=True, help="path to the quantization checkpoint directory.")
-    parser.add_argument("--output-root", type=str, default="", help="root to the output checkpoint directory.")
-    parser.add_argument("--model-name", type=str, default=None, help="name of the model.")
+    parser.add_argument("--quant-path", type=str, default="qwen-image1/", help="path to the quantization checkpoint directory.")
+    parser.add_argument("--output-root", type=str, default="save_model/", help="root to the output checkpoint directory.")
+    parser.add_argument("--model-name", type=str, default="qwen-image2/", help="name of the model.")
     parser.add_argument("--float-point", action="store_true", help="use float-point 4-bit quantization.")
     args = parser.parse_args()
     if not args.output_root:
@@ -396,7 +607,11 @@ if __name__ == "__main__":
     else:
         model_name = args.model_name
     assert model_name, "Model name must be provided."
-    assert "flux" in model_name.lower(), "Only Flux models are supported."
+
+    # Detect model type and select appropriate conversion function
+    model_type = _detect_model_type(model_name)
+    print(f"Detected model type: {model_type}")
+
     state_dict_path = os.path.join(args.quant_path, "model.pt")
     scale_dict_path = os.path.join(args.quant_path, "scale.pt")
     smooth_dict_path = os.path.join(args.quant_path, "smooth.pt")
@@ -406,7 +621,14 @@ if __name__ == "__main__":
     scale_dict = torch.load(scale_dict_path, map_location="cpu")
     smooth_dict = torch.load(smooth_dict_path, map_location=map_location) if os.path.exists(smooth_dict_path) else {}
     branch_dict = torch.load(branch_dict_path, map_location=map_location) if os.path.exists(branch_dict_path) else {}
-    converted_state_dict, other_state_dict = convert_to_nunchaku_flux_state_dicts(
+
+    # Select conversion function based on model type
+    if model_type == "qwenimage":
+        convert_fn = convert_to_nunchaku_qwenimage_state_dicts
+    else:
+        convert_fn = convert_to_nunchaku_flux_state_dicts
+
+    converted_state_dict, other_state_dict = convert_fn(
         state_dict=state_dict,
         scale_dict=scale_dict,
         smooth_dict=smooth_dict,

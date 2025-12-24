@@ -16,6 +16,7 @@ from diffusers.models.transformers.transformer_flux import (
     FluxSingleTransformerBlock,
     FluxTransformerBlock,
 )
+from diffusers.models.transformers.transformer_qwenimage import QwenImageTransformerBlock
 from omniconfig import configclass
 
 from deepcompressor.data.cache import (
@@ -29,8 +30,8 @@ from deepcompressor.dataset.action import CacheAction, ConcatCacheAction
 from deepcompressor.dataset.cache import BaseCalibCacheLoader
 from deepcompressor.dataset.config import BaseDataLoaderConfig
 
-from ..nn.struct import DiffusionBlockStruct, DiffusionModelStruct
-from .base import DiffusionDataset
+from deepcompressor.app.diffusion.nn.struct import DiffusionBlockStruct, DiffusionModelStruct
+from deepcompressor.app.diffusion.dataset.base import DiffusionDataset
 
 __all__ = [
     "DiffusionCalibCacheLoaderConfig",
@@ -179,7 +180,7 @@ class DiffusionCalibCacheLoader(BaseCalibCacheLoader):
                     )
                 ),
             )
-        elif isinstance(module, (Attention, FluxAttention)):
+        elif isinstance(module, FluxAttention):
             return IOTensorsCache(
                 inputs=TensorsCache(
                     OrderedDict(
@@ -188,6 +189,16 @@ class DiffusionCalibCacheLoader(BaseCalibCacheLoader):
                     ),
                 ),
                 outputs=TensorCache(),
+            )
+        elif isinstance(module, Attention):
+            return IOTensorsCache(
+                inputs=TensorsCache(
+                    OrderedDict(
+                        hidden_states=TensorCache(channels_dim=None),
+                        encoder_hidden_states=TensorCache(channels_dim=None),
+                    ),
+                ),
+                outputs=TensorCache(channels_dim=None),
             )
         else:
             return super()._init_cache(name, module)
@@ -226,7 +237,7 @@ class DiffusionCalibCacheLoader(BaseCalibCacheLoader):
             assert len(args) == 0, f"Invalid args: {args}"
         else:
             hidden_states = args[0]
-        if isinstance(m, (FluxTransformerBlock, JointTransformerBlock, FluxSingleTransformerBlock)):
+        if isinstance(m, (FluxTransformerBlock, JointTransformerBlock, FluxSingleTransformerBlock, QwenImageTransformerBlock)):
             if "encoder_hidden_states" in kwargs:
                 encoder_hidden_states = kwargs.pop("encoder_hidden_states")
             else:
@@ -256,7 +267,7 @@ class DiffusionCalibCacheLoader(BaseCalibCacheLoader):
             `dict[str | int, Any]`:
                 Dictionary for updating the next layer inputs.
         """
-        if isinstance(m, (FluxTransformerBlock, JointTransformerBlock, FluxSingleTransformerBlock)):
+        if isinstance(m, (FluxTransformerBlock, JointTransformerBlock, FluxSingleTransformerBlock, QwenImageTransformerBlock)):
             assert isinstance(outputs, tuple) and len(outputs) == 2
             encoder_hidden_states, hidden_states = outputs
             return {0: hidden_states.detach().cpu(), 1: encoder_hidden_states.detach().cpu()}
