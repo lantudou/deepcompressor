@@ -863,8 +863,8 @@ def smooth_upscale_param(param: nn.Parameter, scale: torch.Tensor, channels_dim:
     dtype = param.dtype
     view_shape = [1] * param.ndim
     view_shape[channels_dim] = -1
-    scale = scale.to(device=param.device).view(view_shape)
-    param.data = param.data.to(dtype=scale.dtype).mul_(scale).to(dtype=dtype)
+    scale = scale.to(device=param.device, dtype=dtype).view(view_shape)
+    param.data.mul_(scale)
     assert not param.data.isnan().any(), "NaN found in param when smoothing"
     assert not param.data.isinf().any(), "Inf found in param when smoothing"
 
@@ -883,10 +883,8 @@ def smooth_downscale_param(param: nn.Parameter, scale: torch.Tensor, channels_di
     dtype = param.dtype
     view_shape = [1] * param.ndim
     view_shape[channels_dim] = -1
-    scale = scale.to(device=param.device).view(view_shape)
-    param_data = param.data.to(dtype=scale.dtype)
-    param_data.narrow(channels_dim, 0, scale.numel()).div_(scale)
-    param.data = param_data.to(dtype=dtype)
+    scale = scale.to(device=param.device, dtype=dtype).view(view_shape)
+    param.data.narrow(channels_dim, 0, scale.numel()).div_(scale)
     assert not param.data.isnan().any(), "NaN found in param when smoothing"
     assert not param.data.isinf().any(), "Inf found in param when smoothing"
 

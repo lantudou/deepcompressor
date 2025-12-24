@@ -13,9 +13,9 @@ from tqdm import tqdm
 from deepcompressor.app.diffusion.config import DiffusionPtqRunConfig
 from deepcompressor.utils.common import hash_str_to_int, tree_map
 
-from ...utils import get_control
-from ..data import get_dataset
-from .utils import CollectHook
+from deepcompressor.app.diffusion.utils import get_control
+from deepcompressor.app.diffusion.dataset.data import get_dataset
+from deepcompressor.app.diffusion.dataset.collect.utils import CollectHook
 
 
 def process(x: torch.Tensor) -> torch.Tensor:
@@ -48,6 +48,7 @@ def collect(config: DiffusionPtqRunConfig, dataset: datasets.Dataset):
     ):
         filenames = batch["filename"]
         prompts = batch["prompt"]
+        
         seeds = [hash_str_to_int(name) for name in filenames]
         generators = [torch.Generator(device=pipeline.device).manual_seed(seed) for seed in seeds]
         pipeline_kwargs = config.eval.get_pipeline_kwargs()
@@ -69,7 +70,49 @@ def collect(config: DiffusionPtqRunConfig, dataset: datasets.Dataset):
             else:
                 pipeline_kwargs["control_image"] = controls
 
-        result_images = pipeline(prompts, generator=generators, **pipeline_kwargs).images
+        target_seq_len = 64
+        prompt_embeds, prompt_embeds_mask = pipeline.encode_prompt(
+            prompt=prompts,
+            prompt_embeds=None,
+            prompt_embeds_mask=None,
+            device=pipeline.device,
+            num_images_per_prompt=1,
+            max_sequence_length=512,
+        )
+        current_seq_len = prompt_embeds.shape[1]
+        if current_seq_len < target_seq_len:
+            pad_len = target_seq_len - current_seq_len
+        # Pad encoder_hidden_states: [batch, seq_len, hidden] -> [batch, 512, hidden]
+        prompt_embeds = torch.nn.functional.pad(
+            prompt_embeds, (0, 0, 0, pad_len), value=0
+        )
+        # Pad encoder_hidden_states_mask: [batch, seq_len] -> [batch, 512]
+        prompt_embeds_mask = torch.nn.functional.pad(
+            prompt_embeds_mask, (0,  pad_len), value=0
+        )
+        
+        negative_prompt_embeds, negative_prompt_embeds_mask = pipeline.encode_prompt(
+            prompt=" ",
+            prompt_embeds=None,
+            prompt_embeds_mask=None,
+            device=pipeline.device,
+            num_images_per_prompt=1,
+            max_sequence_length=512,
+        )
+        current_seq_len = negative_prompt_embeds.shape[1]
+        if current_seq_len < target_seq_len:
+            pad_len = target_seq_len - current_seq_len
+        # Pad encoder_hidden_states: [batch, seq_len, hidden] -> [batch, 512, hidden]
+        negative_prompt_embeds = torch.nn.functional.pad(
+            negative_prompt_embeds, (0, 0, 0, pad_len), value=0
+        )
+        # Pad encoder_hidden_states_mask: [batch, seq_len] -> [batch, 512]
+        negative_prompt_embeds_mask = torch.nn.functional.pad(
+            negative_prompt_embeds_mask, (0,  pad_len), value=0
+        )
+        
+        
+        result_images = pipeline(prompt_embeds=prompt_embeds, prompt_embeds_mask=prompt_embeds_mask, negative_prompt_embeds=negative_prompt_embeds, negative_prompt_embeds_mask=negative_prompt_embeds_mask,generator=generators, target_seq_len=target_seq_len, **pipeline_kwargs).images
         num_guidances = (len(caches) // batch_size) // config.eval.num_steps
         num_steps = len(caches) // (batch_size * num_guidances)
         assert (
@@ -113,7 +156,7 @@ class CollectConfig:
 if __name__ == "__main__":
     parser = DiffusionPtqRunConfig.get_parser()
     parser.add_config(CollectConfig, scope="collect", prefix="collect")
-    configs, _, unused_cfgs, unused_args, unknown_args = parser.parse_known_args()
+    configs, _, unused_cfgs, unused_args, unknown_args = parser.parse_known_args(["examples/diffusion/configs/model/qwenimage.yaml", "examples/diffusion/configs/collect/qdiff.yaml"])
     ptq_config, collect_config = configs[""], configs["collect"]
     assert isinstance(ptq_config, DiffusionPtqRunConfig)
     assert isinstance(collect_config, CollectConfig)

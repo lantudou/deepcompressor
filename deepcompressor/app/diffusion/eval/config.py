@@ -19,7 +19,7 @@ from deepcompressor.app.diffusion.dataset.data import get_dataset
 from deepcompressor.utils.common import hash_str_to_int
 
 from ..utils import get_control
-from .metrics import compute_image_metrics
+#from .metrics import compute_image_metrics
 
 __all__ = ["DiffusionEvalConfig"]
 
@@ -95,7 +95,8 @@ class DiffusionEvalConfig:
     ref_root: str = ""
     gt_stats_root: str = ""
     control_root: str | None = None
-
+    negative_prompt : str = ""
+    txt_seq_lens : int | None = None
     chunk_start: int = 0
     chunk_step: int = 1
     chunk_only: bool = False

@@ -10,10 +10,15 @@ from diffusers import DiffusionPipeline
 from deepcompressor.app.llm.nn.patch import patch_attention, patch_gemma_rms_norm
 from deepcompressor.app.llm.ptq import ptq as llm_ptq
 from deepcompressor.utils import tools
-
-from .config import DiffusionPtqCacheConfig, DiffusionPtqRunConfig, DiffusionQuantCacheConfig, DiffusionQuantConfig
-from .nn.struct import DiffusionModelStruct
-from .quant import (
+from diffusers.models.transformers import (
+    FluxTransformer2DModel,
+    PixArtTransformer2DModel,
+    QwenImageTransformer2DModel,
+    SanaTransformer2DModel,
+)
+from deepcompressor.app.diffusion.config import DiffusionPtqCacheConfig, DiffusionPtqRunConfig, DiffusionQuantCacheConfig, DiffusionQuantConfig
+from deepcompressor.app.diffusion.nn.struct import DiffusionModelStruct
+from deepcompressor.app.diffusion.quant import (
     load_diffusion_weights_state_dict,
     quantize_diffusion_activations,
     quantize_diffusion_weights,
@@ -300,6 +305,7 @@ def main(config: DiffusionPtqRunConfig, logging_level: int = tools.logging.DEBUG
     pipeline = config.pipeline.build()
     if "nf4" not in config.pipeline.name and "gguf" not in config.pipeline.name:
         model = DiffusionModelStruct.construct(pipeline)
+        print(model.config)
         tools.logging.Formatter.indent_dec()
         save_dirpath = os.path.join(config.output.running_job_dirpath, "cache")
         if config.save_model:
@@ -355,11 +361,66 @@ def main(config: DiffusionPtqRunConfig, logging_level: int = tools.logging.DEBUG
         output=config.output.running_dirpath, job=config.output.running_job_dirname
     )
     if config.skip_eval:
-        if not config.skip_gen:
-            logger.info("* Generating image")
-            tools.logging.Formatter.indent_inc()
-            config.eval.generate(pipeline, task=config.pipeline.task)
-            tools.logging.Formatter.indent_dec()
+        with torch.no_grad():
+            pipeline.transformer = model
+            prompts = "A cat holding a sign that says hello world"
+            target_seq_len = 64
+
+            # Encode prompts with padding to target_seq_len
+            prompt_embeds, prompt_embeds_mask = pipeline.encode_prompt(
+                prompt=prompts,
+                prompt_embeds=None,
+                prompt_embeds_mask=None,
+                device=pipeline.device,
+                num_images_per_prompt=1,
+                max_sequence_length=512,
+            )
+            current_seq_len = prompt_embeds.shape[1]
+            if current_seq_len < target_seq_len:
+                pad_len = target_seq_len - current_seq_len
+                # Pad encoder_hidden_states: [batch, seq_len, hidden] -> [batch, target_seq_len, hidden]
+                prompt_embeds = torch.nn.functional.pad(
+                    prompt_embeds, (0, 0, 0, pad_len), value=0
+                )
+                # Pad encoder_hidden_states_mask: [batch, seq_len] -> [batch, target_seq_len]
+                prompt_embeds_mask = torch.nn.functional.pad(
+                    prompt_embeds_mask, (0, pad_len), value=0
+                )
+
+            negative_prompt_embeds, negative_prompt_embeds_mask = pipeline.encode_prompt(
+                prompt=" ",
+                prompt_embeds=None,
+                prompt_embeds_mask=None,
+                device=pipeline.device,
+                num_images_per_prompt=1,
+                max_sequence_length=512,
+            )
+            current_seq_len = negative_prompt_embeds.shape[1]
+            if current_seq_len < target_seq_len:
+                pad_len = target_seq_len - current_seq_len
+                # Pad encoder_hidden_states: [batch, seq_len, hidden] -> [batch, target_seq_len, hidden]
+                negative_prompt_embeds = torch.nn.functional.pad(
+                    negative_prompt_embeds, (0, 0, 0, pad_len), value=0
+                )
+                # Pad encoder_hidden_states_mask: [batch, seq_len] -> [batch, target_seq_len]
+                negative_prompt_embeds_mask = torch.nn.functional.pad(
+                    negative_prompt_embeds_mask, (0, pad_len), value=0
+                )
+
+            generator = torch.manual_seed(0)
+            # Use the custom pipeline with target_seq_len parameter
+            image = pipeline(
+                prompt_embeds=prompt_embeds,
+                prompt_embeds_mask=prompt_embeds_mask,
+                negative_prompt_embeds=negative_prompt_embeds,
+                negative_prompt_embeds_mask=negative_prompt_embeds_mask,
+                target_seq_len=target_seq_len,
+                num_inference_steps=50,
+                true_cfg_scale=4.0,
+                generator=generator,
+                target_seq_len=target_seq_len,  # Use the configurable parameter
+            ).images[0]
+            image.save("qwen-image-test.png")
     else:
         logger.info(f"* Evaluating model {'(skipping generation)' if config.skip_gen else ''}")
         tools.logging.Formatter.indent_inc()
@@ -373,7 +434,10 @@ def main(config: DiffusionPtqRunConfig, logging_level: int = tools.logging.DEBUG
 
 
 if __name__ == "__main__":
-    config, _, unused_cfgs, unused_args, unknown_args = DiffusionPtqRunConfig.get_parser().parse_known_args()
+    parser = DiffusionPtqRunConfig.get_parser()
+    config, _, unused_cfgs, unused_args, unknown_args = parser.parse_known_args(["examples/diffusion/configs/model/qwenimage.yaml", "examples/diffusion/configs/svdquant/int4.yaml", "examples/diffusion/configs/svdquant/fast.yaml", "examples/diffusion/configs/svdquant/gptq.yaml"])
+    config.skip_eval = True
+    config.save_model =  "./qwen-image1/"
     assert isinstance(config, DiffusionPtqRunConfig)
     if len(unused_cfgs) > 0:
         tools.logging.warning(f"Unused configurations: {unused_cfgs}")

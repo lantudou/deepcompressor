@@ -1,0 +1,85 @@
+pipeline:
+  name: qwenimage
+  dtype: torch.bfloat16
+eval:
+  num_steps: 50
+  guidance_scale: 4.0
+  protocol: fmeuler{num_steps}-g{guidance_scale}
+  num_gpus: 1
+  batch_size_per_gpu : 1
+  negative_prompt : " "
+  txt_seq_lens : 512
+quant:
+  calib:
+    batch_size: 8
+  wgts:
+    calib_range:
+      element_batch_size: 64
+      sample_batch_size: 8
+      element_size: 512
+      sample_size: -1
+    low_rank:
+      sample_batch_size: 8
+      sample_size: -1
+      # 覆盖默认配置，为 mod 层添加 skip（W4A16 不需要 lowrank 分支）
+      skips:
+      - embed
+      - resblock
+      - transformer_proj_in
+      - transformer_proj_out
+      - transformer_norm
+      - transformer_add_norm
+      - transformer_mod  # QwenImage mod 层使用 W4A16，不需要 SVD lowrank
+      - down_sample
+      - up_sample
+    skips:
+    - embed
+    - resblock_shortcut
+    - resblock_time_proj
+    - transformer_proj_in
+    - transformer_proj_out
+    - down_sample
+    - up_sample
+  ipts:
+    calib_range:
+      element_batch_size: 64
+      sample_batch_size: 8
+      element_size: 512
+      sample_size: -1
+    skips:
+    - embed
+    - resblock_shortcut
+    - resblock_time_proj
+    - transformer_proj_in
+    - transformer_proj_out
+    - transformer_norm
+    - transformer_add_norm
+    - transformer_mod
+    - down_sample
+    - up_sample
+  opts:
+    calib_range:
+      element_batch_size: 64
+      sample_batch_size: 8
+      element_size: 512
+      sample_size: -1
+  smooth:
+    proj:
+      element_batch_size: -1
+      sample_batch_size: 8
+      element_size: -1
+      sample_size: -1
+      # 与 Flux 的 transformer_norm 一样，W4A16 层跳过 smooth
+      skips:
+      - embed
+      - resblock
+      - transformer_proj_in
+      - transformer_proj_out
+      - transformer_norm
+      - transformer_add_norm
+      - transformer_mod  # QwenImage mod 层使用 W4A16，跳过 smooth
+      - down_sample
+      - up_sample
+    attn:
+      sample_batch_size: 8
+      sample_size: -1

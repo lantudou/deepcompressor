@@ -6,8 +6,10 @@ import typing as tp
 from abc import abstractmethod
 from collections import OrderedDict, defaultdict
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 # region imports
+
 import torch.nn as nn
 from diffusers.models.activations import GEGLU, GELU, ApproximateGELU, SwiGLU
 from diffusers.models.attention import BasicTransformerBlock, FeedForward, JointTransformerBlock
@@ -35,6 +37,10 @@ from diffusers.models.transformers.transformer_flux import (
     FluxSingleTransformerBlock,
     FluxTransformer2DModel,
     FluxTransformerBlock,
+)
+from diffusers.models.transformers.transformer_qwenimage import (
+    QwenImageTransformer2DModel,
+    QwenImageTransformerBlock,
 )
 from diffusers.models.transformers.transformer_sd3 import SD3Transformer2DModel
 from diffusers.models.unets.unet_2d import UNet2DModel
@@ -73,6 +79,7 @@ from deepcompressor.nn.struct.base import BaseModuleStruct
 from deepcompressor.utils.common import join_name
 
 from .attention import DiffusionAttentionProcessor
+from ..qwenimage import QwenImagePipelineWithSeqLen as QwenImagePipeline
 
 # endregion
 
@@ -85,6 +92,7 @@ DIT_BLOCK_CLS = tp.Union[
     JointTransformerBlock,
     FluxSingleTransformerBlock,
     FluxTransformerBlock,
+    QwenImageTransformerBlock,
     SanaTransformerBlock,
 ]
 UNET_BLOCK_CLS = tp.Union[
@@ -98,6 +106,7 @@ UNET_BLOCK_CLS = tp.Union[
 DIT_CLS = tp.Union[
     Transformer2DModel,
     PixArtTransformer2DModel,
+    QwenImageTransformer2DModel,
     SD3Transformer2DModel,
     FluxTransformer2DModel,
     SanaTransformer2DModel,
@@ -112,6 +121,7 @@ DIT_PIPELINE_CLS = tp.Union[
     FluxPipeline,
     FluxControlPipeline,
     FluxFillPipeline,
+    QwenImagePipeline,
     SanaPipeline,
 ]
 PIPELINE_CLS = tp.Union[UNET_PIPELINE_CLS, DIT_PIPELINE_CLS]
@@ -567,6 +577,8 @@ class DiffusionTransformerBlockStruct(TransformerBlockStruct, DiffusionBlockStru
     # region relative keys
     norm_rkey: tp.ClassVar[str] = "transformer_norm"
     add_norm_rkey: tp.ClassVar[str] = "transformer_add_norm"
+    mod_rkey: tp.ClassVar[str] = "transformer_mod"
+    """Modulation layers (e.g., img_mod, txt_mod in QwenImage)"""
     attn_struct_cls: tp.ClassVar[type[DiffusionAttentionStruct]] = DiffusionAttentionStruct
     ffn_struct_cls: tp.ClassVar[type[DiffusionFeedForwardStruct]] = DiffusionFeedForwardStruct
     # endregion
@@ -577,20 +589,31 @@ class DiffusionTransformerBlockStruct(TransformerBlockStruct, DiffusionBlockStru
     post_attn_add_norms: list[nn.LayerNorm] = field(init=False, repr=False, default_factory=list)
     post_ffn_norm: None = field(init=False, repr=False, default=None)
     post_add_ffn_norm: None = field(init=False, repr=False, default=None)
+    mod: nn.Module | None = None
+    """Modulation layer (e.g., img_mod in QwenImage)"""
+    add_mod: nn.Module | None = None
+    """Additional modulation layer (e.g., txt_mod in QwenImage)"""
     # endregion
     # region relative names
     post_attn_norm_rnames: list[str] = field(init=False, repr=False, default_factory=list)
     post_attn_add_norm_rnames: list[str] = field(init=False, repr=False, default_factory=list)
     post_ffn_norm_rname: str = field(init=False, repr=False, default="")
     post_add_ffn_norm_rname: str = field(init=False, repr=False, default="")
+    mod_rname: str = ""
+    add_mod_rname: str = ""
     # endregion
     # region attributes
     norm_type: str
     add_norm_type: str
     # endregion
+    # region absolute names
+    mod_name: str = field(init=False, repr=False, default="")
+    add_mod_name: str = field(init=False, repr=False, default="")
+    # endregion
     # region absolute keys
     norm_key: str = field(init=False, repr=False)
     add_norm_key: str = field(init=False, repr=False)
+    mod_key: str = field(init=False, repr=False, default="")
     # endregion
     # region child structs
     pre_attn_norm_structs: list[DiffusionModuleStruct | None] = field(init=False, repr=False)
@@ -600,6 +623,8 @@ class DiffusionTransformerBlockStruct(TransformerBlockStruct, DiffusionBlockStru
     attn_structs: list[DiffusionAttentionStruct] = field(init=False, repr=False)
     ffn_struct: DiffusionFeedForwardStruct | None = field(init=False, repr=False)
     add_ffn_struct: DiffusionFeedForwardStruct | None = field(init=False, repr=False)
+    mod_struct: DiffusionModuleStruct | None = field(init=False, repr=False, default=None)
+    add_mod_struct: DiffusionModuleStruct | None = field(init=False, repr=False, default=None)
     # endregion
 
     def __post_init__(self) -> None:
@@ -630,8 +655,25 @@ class DiffusionTransformerBlockStruct(TransformerBlockStruct, DiffusionBlockStru
                 rname=self.pre_add_ffn_norm_rname,
                 rkey=self.add_norm_rkey,
             )
+        # Initialize mod structs (e.g., for QwenImage)
+        if self.mod is not None:
+            self.mod_key = join_name(self.key, self.mod_rkey, sep="_")
+            self.mod_name = join_name(self.name, self.mod_rname)
+            self.mod_struct = DiffusionModuleStruct(
+                self.mod, parent=self, fname="mod", rname=self.mod_rname, rkey=self.mod_rkey
+            )
+        if self.add_mod is not None:
+            self.add_mod_name = join_name(self.name, self.add_mod_rname)
+            self.add_mod_struct = DiffusionModuleStruct(
+                self.add_mod, parent=self, fname="add_mod", rname=self.add_mod_rname, rkey=self.mod_rkey
+            )
 
     def named_key_modules(self) -> tp.Generator[tp.Tuple[str, str, nn.Module, BaseModuleStruct, str], None, None]:
+        # Yield mod layers first (e.g., img_mod, txt_mod in QwenImage)
+        if self.mod_struct is not None:
+            yield from self.mod_struct.named_key_modules()
+        if self.add_mod_struct is not None:
+            yield from self.add_mod_struct.named_key_modules()
         for attn_norm in self.attn_norm_structs:
             if attn_norm.module is not None:
                 yield from attn_norm.named_key_modules()
@@ -731,8 +773,25 @@ class DiffusionTransformerBlockStruct(TransformerBlockStruct, DiffusionBlockStru
             ffn, ffn_rname = module.ff, "ff"
             pre_add_ffn_norm, pre_add_ffn_norm_rname = module.norm2_context, "norm2_context"
             add_ffn, add_ffn_rname = module.ff_context, "ff_context"
+        elif isinstance(module, QwenImageTransformerBlock):
+            parallel = False
+            norm_type = add_norm_type = "layer_norm"
+            pre_attn_norms, pre_attn_norm_rnames = [module.img_norm1], ["img_norm1"]
+            attns, attn_rnames = [module.attn], ["attn"]
+            pre_attn_add_norms, pre_attn_add_norm_rnames = [module.txt_norm1], ["txt_norm1"]
+            pre_ffn_norm, pre_ffn_norm_rname = module.img_norm2, "img_norm2"
+            ffn, ffn_rname = module.img_mlp, "img_mlp"
+            pre_add_ffn_norm, pre_add_ffn_norm_rname = module.txt_norm2, "txt_norm2"
+            add_ffn, add_ffn_rname = module.txt_mlp, "txt_mlp"
+            mod, mod_rname = module.img_mod, "img_mod"
+            add_mod, add_mod_rname = module.txt_mod, "txt_mod"
         else:
             raise NotImplementedError(f"Unsupported module type: {type(module)}")
+        # mod is optional, only QwenImage has it
+        mod = locals().get("mod", None)
+        mod_rname = locals().get("mod_rname", "")
+        add_mod = locals().get("add_mod", None)
+        add_mod_rname = locals().get("add_mod_rname", "")
         return DiffusionTransformerBlockStruct(
             module=module,
             parent=parent,
@@ -748,6 +807,8 @@ class DiffusionTransformerBlockStruct(TransformerBlockStruct, DiffusionBlockStru
             ffn=ffn,
             pre_add_ffn_norm=pre_add_ffn_norm,
             add_ffn=add_ffn,
+            mod=mod,
+            add_mod=add_mod,
             pre_attn_norm_rnames=pre_attn_norm_rnames,
             pre_attn_add_norm_rnames=pre_attn_add_norm_rnames,
             attn_rnames=attn_rnames,
@@ -755,6 +816,8 @@ class DiffusionTransformerBlockStruct(TransformerBlockStruct, DiffusionBlockStru
             ffn_rname=ffn_rname,
             pre_add_ffn_norm_rname=pre_add_ffn_norm_rname,
             add_ffn_rname=add_ffn_rname,
+            mod_rname=mod_rname,
+            add_mod_rname=add_mod_rname,
             norm_type=norm_type,
             add_norm_type=add_norm_type,
         )
@@ -798,6 +861,9 @@ class DiffusionTransformerBlockStruct(TransformerBlockStruct, DiffusionBlockStru
         key_map[down_proj_rkey].add(down_proj_key)
         key_map[add_up_proj_rkey].add(add_up_proj_key)
         key_map[add_down_proj_rkey].add(add_down_proj_key)
+        # Add mod key for modulation layers (e.g., img_mod, txt_mod in QwenImage)
+        mod_rkey = mod_key = cls.mod_rkey
+        key_map[mod_rkey].add(mod_key)
         return {k: v for k, v in key_map.items() if v}
 
 
@@ -1599,6 +1665,8 @@ class DiTStruct(DiffusionModelStruct, DiffusionTransformerStruct):
     """temb = time_embed(timesteps)"""
     text_embed_rkey: tp.ClassVar[str] = "text_embed"
     """encoder_hidden_states = text_embed(encoder_hidden_states)"""
+    text_norm_rkey: tp.ClassVar[str] = "text_embed"
+    """encoder_hidden_states = text_norm(encoder_hidden_states), share key with text_embed"""
     norm_in_rkey: tp.ClassVar[str] = "input_embed"
     """hidden_states = norm_in(hidden_states)"""
     proj_in_rkey: tp.ClassVar[str] = "input_embed"
@@ -1614,6 +1682,8 @@ class DiTStruct(DiffusionModelStruct, DiffusionTransformerStruct):
     input_embed: PatchEmbed
     time_embed: AdaLayerNormSingle | CombinedTimestepTextProjEmbeddings | TimestepEmbedding
     text_embed: PixArtAlphaTextProjection | nn.Linear
+    text_norm: nn.Module | None = None
+    """Optional text normalization layer (e.g., RMSNorm in QwenImage)"""
     norm_in: None = field(init=False, repr=False, default=None)
     proj_in: None = field(init=False, repr=False, default=None)
     norm_out: nn.LayerNorm | AdaLayerNormContinuous | None
@@ -1623,6 +1693,7 @@ class DiTStruct(DiffusionModelStruct, DiffusionTransformerStruct):
     input_embed_rname: str
     time_embed_rname: str
     text_embed_rname: str
+    text_norm_rname: str = ""
     norm_in_rname: str = field(init=False, repr=False, default="")
     proj_in_rname: str = field(init=False, repr=False, default="")
     norm_out_rname: str
@@ -1632,13 +1703,31 @@ class DiTStruct(DiffusionModelStruct, DiffusionTransformerStruct):
     input_embed_name: str = field(init=False, repr=False)
     time_embed_name: str = field(init=False, repr=False)
     text_embed_name: str = field(init=False, repr=False)
+    text_norm_name: str = field(init=False, repr=False, default="")
     # endregion
     # region absolute keys
     input_embed_key: str = field(init=False, repr=False)
     time_embed_key: str = field(init=False, repr=False)
     text_embed_key: str = field(init=False, repr=False)
+    text_norm_key: str = field(init=False, repr=False, default="")
     norm_out_key: str = field(init=False, repr=False)
     # endregion
+
+    @property
+    def config(self):
+        """Proxy to the underlying module's config."""
+        return self.module.config
+
+    def __getattr__(self, name: str):
+        """Proxy undefined attributes to the underlying module."""
+        # Avoid infinite recursion by checking if 'module' exists
+        if name == 'module':
+            raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
+        # Try to get the attribute from the underlying module
+        try:
+            return getattr(self.module, name)
+        except AttributeError:
+            raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
 
     @property
     def num_blocks(self) -> int:
@@ -1655,7 +1744,7 @@ class DiTStruct(DiffusionModelStruct, DiffusionTransformerStruct):
     def __post_init__(self) -> None:
         super().__post_init__()
         self.pre_module_structs = {}
-        for fname in ("input_embed", "time_embed", "text_embed"):
+        for fname in ("input_embed", "time_embed", "text_embed", "text_norm"):
             module, rname, rkey = getattr(self, fname), getattr(self, f"{fname}_rname"), getattr(self, f"{fname}_rkey")
             setattr(self, f"{fname}_key", join_name(self.key, rkey, sep="_"))
             if module is not None or rname:
@@ -1678,7 +1767,10 @@ class DiTStruct(DiffusionModelStruct, DiffusionTransformerStruct):
                 )
 
     def get_prev_module_keys(self) -> tuple[str, ...]:
-        return tuple({self.input_embed_key, self.time_embed_key, self.text_embed_key})
+        keys = {self.input_embed_key, self.time_embed_key, self.text_embed_key}
+        if self.text_norm_key:
+            keys.add(self.text_norm_key)
+        return tuple(keys)
 
     def get_post_module_keys(self) -> tuple[str, ...]:
         return tuple({self.norm_out_key, self.proj_out_key})
@@ -1747,8 +1839,18 @@ class DiTStruct(DiffusionModelStruct, DiffusionTransformerStruct):
                 norm_out, norm_out_rname = module.norm_out, "norm_out"
                 proj_out, proj_out_rname = module.proj_out, "proj_out"
                 transformer_blocks, transformer_blocks_rname = module.transformer_blocks, "transformer_blocks"
+            elif isinstance(module, QwenImageTransformer2DModel):
+                input_embed, input_embed_rname = module.img_in, "img_in"
+                time_embed, time_embed_rname = module.time_text_embed, "time_text_embed"
+                text_embed, text_embed_rname = module.txt_in, "txt_in"
+                norm_out, norm_out_rname = module.norm_out, "norm_out"
+                proj_out, proj_out_rname = module.proj_out, "proj_out"
+                transformer_blocks, transformer_blocks_rname = module.transformer_blocks, "transformer_blocks"
             else:
                 raise NotImplementedError(f"Unsupported module type: {type(module)}")
+            # text_norm is optional, only QwenImage has it
+            text_norm = getattr(module, "txt_norm", None)
+            text_norm_rname = "txt_norm" if text_norm is not None else ""
             return DiTStruct(
                 module=module,
                 parent=parent,
@@ -1759,12 +1861,14 @@ class DiTStruct(DiffusionModelStruct, DiffusionTransformerStruct):
                 input_embed=input_embed,
                 time_embed=time_embed,
                 text_embed=text_embed,
+                text_norm=text_norm,
                 transformer_blocks=transformer_blocks,
                 norm_out=norm_out,
                 proj_out=proj_out,
                 input_embed_rname=input_embed_rname,
                 time_embed_rname=time_embed_rname,
                 text_embed_rname=text_embed_rname,
+                text_norm_rname=text_norm_rname,
                 norm_out_rname=norm_out_rname,
                 proj_out_rname=proj_out_rname,
                 transformer_blocks_rname=transformer_blocks_rname,
@@ -1789,6 +1893,7 @@ class DiTStruct(DiffusionModelStruct, DiffusionTransformerStruct):
         keys.add(cls.input_embed_rkey)
         keys.add(cls.time_embed_rkey)
         keys.add(cls.text_embed_rkey)
+        keys.add(cls.text_norm_rkey)
         keys.add(cls.norm_in_rkey)
         keys.add(cls.proj_in_rkey)
         keys.add(cls.norm_out_rkey)
@@ -1800,6 +1905,7 @@ class DiTStruct(DiffusionModelStruct, DiffusionTransformerStruct):
             key_map["embed"].add(cls.input_embed_rkey)
             key_map["embed"].add(cls.time_embed_rkey)
             key_map["embed"].add(cls.text_embed_rkey)
+            key_map["embed"].add(cls.text_norm_rkey)
             key_map["embed"].add(cls.norm_in_rkey)
             key_map["embed"].add(cls.proj_in_rkey)
             key_map["embed"].add(cls.norm_out_rkey)
