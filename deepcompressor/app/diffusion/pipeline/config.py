@@ -29,7 +29,8 @@ from ..nn.patch import (
     replace_up_block_conv_with_concat_conv,
     shift_input_activations,
 )
-
+from ..qwenimage import QwenImagePipelineWithSeqLen as QwenImagePipeline
+#from diffusers.pipelines.qwenimage import QwenImagePipeline
 __all__ = ["DiffusionPipelineConfig"]
 
 
@@ -344,6 +345,8 @@ class DiffusionPipelineConfig:
                 path = "black-forest-labs/FLUX.1-Fill-dev"
             elif name == "flux.1-schnell":
                 path = "black-forest-labs/FLUX.1-schnell"
+            elif name.startswith("qwenimage"):
+                path = "Qwen/Qwen-Image"
             else:
                 raise ValueError(f"Path for {name} is not specified.")
         if name in ["flux.1-canny-dev", "flux.1-depth-dev"]:
@@ -357,6 +360,8 @@ class DiffusionPipelineConfig:
                 pipeline.text_encoder.to(dtype)
             else:
                 pipeline = SanaPipeline.from_pretrained(path, torch_dtype=dtype)
+        elif name.startswith("qwenimage"):
+            pipeline = QwenImagePipeline.from_pretrained(path, torch_dtype=dtype)
         else:
             pipeline = AutoPipelineForText2Image.from_pretrained(path, torch_dtype=dtype)
         pipeline = pipeline.to(device)
