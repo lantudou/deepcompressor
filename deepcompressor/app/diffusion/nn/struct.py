@@ -31,6 +31,7 @@ from diffusers.models.transformers.pixart_transformer_2d import PixArtTransforme
 from diffusers.models.transformers.sana_transformer import GLUMBConv, SanaTransformer2DModel, SanaTransformerBlock
 from diffusers.models.transformers.transformer_2d import Transformer2DModel
 from diffusers.models.transformers.transformer_flux import (
+    FluxAttention,
     FluxSingleTransformerBlock,
     FluxTransformer2DModel,
     FluxTransformerBlock,
@@ -343,7 +344,20 @@ class DiffusionAttentionStruct(AttentionStruct):
         idx: int = 0,
         **kwargs,
     ) -> "DiffusionAttentionStruct":
-        if module.is_cross_attention:
+        # FluxAttention doesn't have is_cross_attention attribute
+        if isinstance(module, FluxAttention):
+            # FluxAttention always has to_q, to_k, to_v
+            q_proj, k_proj, v_proj = module.to_q, module.to_k, module.to_v
+            add_q_proj = getattr(module, "add_q_proj", None)
+            add_k_proj = getattr(module, "add_k_proj", None)
+            add_v_proj = getattr(module, "add_v_proj", None)
+            add_o_proj = getattr(module, "to_add_out", None)
+            q_proj_rname, k_proj_rname, v_proj_rname = "to_q", "to_k", "to_v"
+            add_q_proj_rname = "add_q_proj" if add_q_proj is not None else ""
+            add_k_proj_rname = "add_k_proj" if add_k_proj is not None else ""
+            add_v_proj_rname = "add_v_proj" if add_v_proj is not None else ""
+            add_o_proj_rname = "to_add_out" if add_o_proj is not None else ""
+        elif module.is_cross_attention:
             q_proj, k_proj, v_proj = module.to_q, None, None
             add_q_proj, add_k_proj, add_v_proj, add_o_proj = None, module.to_k, module.to_v, None
             q_proj_rname, k_proj_rname, v_proj_rname = "to_q", "", ""
@@ -355,8 +369,10 @@ class DiffusionAttentionStruct(AttentionStruct):
             add_v_proj = getattr(module, "add_v_proj", None)
             add_o_proj = getattr(module, "to_add_out", None)
             q_proj_rname, k_proj_rname, v_proj_rname = "to_q", "to_k", "to_v"
-            add_q_proj_rname, add_k_proj_rname, add_v_proj_rname = "add_q_proj", "add_k_proj", "add_v_proj"
-            add_o_proj_rname = "to_add_out"
+            add_q_proj_rname = "add_q_proj" if add_q_proj is not None else ""
+            add_k_proj_rname = "add_k_proj" if add_k_proj is not None else ""
+            add_v_proj_rname = "add_v_proj" if add_v_proj is not None else ""
+            add_o_proj_rname = "to_add_out" if add_o_proj is not None else ""
         if getattr(module, "to_out", None) is not None:
             o_proj = module.to_out[0]
             o_proj_rname = "to_out.0"
@@ -375,12 +391,22 @@ class DiffusionAttentionStruct(AttentionStruct):
             with_rope = True
         else:
             with_rope = False  # TODO: fix for other processors
+        # Calculate num_key_value_heads safely for different attention types
+        if k_proj is not None:
+            # Standard attention: calculate from k_proj
+            num_key_value_heads = k_proj.weight.shape[0] // (q_proj.weight.shape[0] // module.heads)
+        elif add_k_proj is not None:
+            # Cross attention or Flux attention with context: calculate from add_k_proj
+            num_key_value_heads = add_k_proj.weight.shape[0] // (q_proj.weight.shape[0] // module.heads)
+        else:
+            # Fallback: assume same as query heads
+            num_key_value_heads = module.heads
         config = AttentionConfigStruct(
             hidden_size=q_proj.weight.shape[1],
             add_hidden_size=add_k_proj.weight.shape[1] if add_k_proj is not None else 0,
             inner_size=q_proj.weight.shape[0],
             num_query_heads=module.heads,
-            num_key_value_heads=module.to_k.weight.shape[0] // (module.to_q.weight.shape[0] // module.heads),
+            num_key_value_heads=num_key_value_heads,
             with_qk_norm=module.norm_q is not None,
             with_rope=with_rope,
             linear_attn=isinstance(module.processor, SanaLinearAttnProcessor2_0),
@@ -1946,7 +1972,7 @@ class FluxStruct(DiTStruct):
         return {k: v for k, v in key_map.items() if v}
 
 
-DiffusionAttentionStruct.register_factory(Attention, DiffusionAttentionStruct._default_construct)
+DiffusionAttentionStruct.register_factory((Attention, FluxAttention), DiffusionAttentionStruct._default_construct)
 
 DiffusionFeedForwardStruct.register_factory(
     (FeedForward, FluxSingleTransformerBlock, GLUMBConv), DiffusionFeedForwardStruct._default_construct
