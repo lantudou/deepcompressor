@@ -43,6 +43,11 @@ from diffusers.models.transformers.transformer_qwenimage import (
     QwenImageTransformerBlock,
 )
 from diffusers.models.transformers.transformer_sd3 import SD3Transformer2DModel
+from diffusers.models.transformers.transformer_wan import (
+    WanAttention,
+    WanTransformer3DModel,
+    WanTransformerBlock,
+)
 from diffusers.models.unets.unet_2d import UNet2DModel
 from diffusers.models.unets.unet_2d_blocks import (
     CrossAttnDownBlock2D,
@@ -80,6 +85,7 @@ from deepcompressor.utils.common import join_name
 
 from .attention import DiffusionAttentionProcessor
 from ..qwenimage import QwenImagePipelineWithSeqLen as QwenImagePipeline
+from ..wan_i2v import WanImageToVideoPipelineForQuant
 
 # endregion
 
@@ -93,6 +99,7 @@ DIT_BLOCK_CLS = tp.Union[
     FluxSingleTransformerBlock,
     FluxTransformerBlock,
     QwenImageTransformerBlock,
+    WanTransformerBlock,
     SanaTransformerBlock,
 ]
 UNET_BLOCK_CLS = tp.Union[
@@ -109,6 +116,7 @@ DIT_CLS = tp.Union[
     QwenImageTransformer2DModel,
     SD3Transformer2DModel,
     FluxTransformer2DModel,
+    WanTransformer3DModel,
     SanaTransformer2DModel,
 ]
 UNET_CLS = tp.Union[UNet2DModel, UNet2DConditionModel]
@@ -122,6 +130,7 @@ DIT_PIPELINE_CLS = tp.Union[
     FluxControlPipeline,
     FluxFillPipeline,
     QwenImagePipeline,
+    WanImageToVideoPipelineForQuant,
     SanaPipeline,
 ]
 PIPELINE_CLS = tp.Union[UNET_PIPELINE_CLS, DIT_PIPELINE_CLS]
@@ -321,7 +330,6 @@ class DiffusionModelStruct(DiffusionBlockStruct):
         return sorted(skeys)
 
 
-@dataclass(kw_only=True)
 class DiffusionAttentionStruct(AttentionStruct):
     module: Attention = field(repr=False, kw_only=False)
     """the module of AttentionBlock"""
@@ -354,8 +362,46 @@ class DiffusionAttentionStruct(AttentionStruct):
         idx: int = 0,
         **kwargs,
     ) -> "DiffusionAttentionStruct":
+        # Initialize internal add projections (only used for WanAttention self-attention)
+        internal_add_k_proj = None
+        internal_add_v_proj = None
+        internal_add_k_proj_rname = ""
+        internal_add_v_proj_rname = ""
+
+        # WanAttention: check is_cross_attention to determine structure
+        if isinstance(module, WanAttention):
+            if module.is_cross_attention:
+                # Cross-attention: q from hidden_states, k/v from encoder_hidden_states
+                # WanAttention cross-attention may also have add_k_proj/add_v_proj for image conditioning
+                # We store add_k_proj/add_v_proj as internal projections to avoid joint attention classification
+                q_proj, k_proj, v_proj = module.to_q, module.to_k, module.to_v
+                add_q_proj, add_k_proj, add_v_proj = None, None, None  # Don't expose at framework level
+                add_o_proj = None
+                q_proj_rname, k_proj_rname, v_proj_rname = "to_q", "to_k", "to_v"
+                add_q_proj_rname, add_k_proj_rname, add_v_proj_rname = "", "", ""
+                add_o_proj_rname = ""
+                # Store internal add projections (similar to self-attention case)
+                internal_add_k_proj = getattr(module, "add_k_proj", None)
+                internal_add_v_proj = getattr(module, "add_v_proj", None)
+                internal_add_k_proj_rname = "add_k_proj" if internal_add_k_proj is not None else ""
+                internal_add_v_proj_rname = "add_v_proj" if internal_add_v_proj is not None else ""
+            else:
+                # Self-attention: WanAttention may have add_k_proj/add_v_proj for image conditioning
+                # These are internal implementation details but need to be quantized
+                # We'll store them separately in WanAttentionStruct
+                q_proj, k_proj, v_proj = module.to_q, module.to_k, module.to_v
+                add_q_proj, add_k_proj, add_v_proj = None, None, None
+                add_o_proj = None
+                q_proj_rname, k_proj_rname, v_proj_rname = "to_q", "to_k", "to_v"
+                add_q_proj_rname, add_k_proj_rname, add_v_proj_rname = "", "", ""
+                add_o_proj_rname = ""
+                # Store internal add projections
+                internal_add_k_proj = getattr(module, "add_k_proj", None)
+                internal_add_v_proj = getattr(module, "add_v_proj", None)
+                internal_add_k_proj_rname = "add_k_proj" if internal_add_k_proj is not None else ""
+                internal_add_v_proj_rname = "add_v_proj" if internal_add_v_proj is not None else ""
         # FluxAttention doesn't have is_cross_attention attribute
-        if isinstance(module, FluxAttention):
+        elif isinstance(module, FluxAttention):
             # FluxAttention always has to_q, to_k, to_v
             q_proj, k_proj, v_proj = module.to_q, module.to_k, module.to_v
             add_q_proj = getattr(module, "add_q_proj", None)
@@ -421,37 +467,214 @@ class DiffusionAttentionStruct(AttentionStruct):
             with_rope=with_rope,
             linear_attn=isinstance(module.processor, SanaLinearAttnProcessor2_0),
         )
-        return DiffusionAttentionStruct(
-            module=module,
-            parent=parent,
-            fname=fname,
-            idx=idx,
-            rname=rname,
-            rkey=rkey,
-            config=config,
-            q_proj=q_proj,
-            k_proj=k_proj,
-            v_proj=v_proj,
-            o_proj=o_proj,
-            add_q_proj=add_q_proj,
-            add_k_proj=add_k_proj,
-            add_v_proj=add_v_proj,
-            add_o_proj=add_o_proj,
-            q=None,  # TODO: add q, k, v
-            k=None,
-            v=None,
-            q_proj_rname=q_proj_rname,
-            k_proj_rname=k_proj_rname,
-            v_proj_rname=v_proj_rname,
-            o_proj_rname=o_proj_rname,
-            add_q_proj_rname=add_q_proj_rname,
-            add_k_proj_rname=add_k_proj_rname,
-            add_v_proj_rname=add_v_proj_rname,
-            add_o_proj_rname=add_o_proj_rname,
-            q_rname="",
-            k_rname="",
-            v_rname="",
-        )
+        # For WanAttention, always use WanAttentionStruct (to handle cross-attention correctly)
+        if WanAttention is not None and isinstance(module, WanAttention):
+            return WanAttentionStruct(
+                module=module,
+                parent=parent,
+                fname=fname,
+                idx=idx,
+                rname=rname,
+                rkey=rkey,
+                config=config,
+                q_proj=q_proj,
+                k_proj=k_proj,
+                v_proj=v_proj,
+                o_proj=o_proj,
+                add_q_proj=add_q_proj,
+                add_k_proj=add_k_proj,
+                add_v_proj=add_v_proj,
+                add_o_proj=add_o_proj,
+                q=None,  # TODO: add q, k, v
+                k=None,
+                v=None,
+                q_proj_rname=q_proj_rname,
+                k_proj_rname=k_proj_rname,
+                v_proj_rname=v_proj_rname,
+                o_proj_rname=o_proj_rname,
+                add_q_proj_rname=add_q_proj_rname,
+                add_k_proj_rname=add_k_proj_rname,
+                add_v_proj_rname=add_v_proj_rname,
+                add_o_proj_rname=add_o_proj_rname,
+                q_rname="",
+                k_rname="",
+                v_rname="",
+                internal_add_k_proj=internal_add_k_proj,
+                internal_add_v_proj=internal_add_v_proj,
+                internal_add_k_proj_rname=internal_add_k_proj_rname,
+                internal_add_v_proj_rname=internal_add_v_proj_rname,
+            )
+        else:
+            return DiffusionAttentionStruct(
+                module=module,
+                parent=parent,
+                fname=fname,
+                idx=idx,
+                rname=rname,
+                rkey=rkey,
+                config=config,
+                q_proj=q_proj,
+                k_proj=k_proj,
+                v_proj=v_proj,
+                o_proj=o_proj,
+                add_q_proj=add_q_proj,
+                add_k_proj=add_k_proj,
+                add_v_proj=add_v_proj,
+                add_o_proj=add_o_proj,
+                q=None,  # TODO: add q, k, v
+                k=None,
+                v=None,
+                q_proj_rname=q_proj_rname,
+                k_proj_rname=k_proj_rname,
+                v_proj_rname=v_proj_rname,
+                o_proj_rname=o_proj_rname,
+                add_q_proj_rname=add_q_proj_rname,
+                add_k_proj_rname=add_k_proj_rname,
+                add_v_proj_rname=add_v_proj_rname,
+                add_o_proj_rname=add_o_proj_rname,
+                q_rname="",
+                k_rname="",
+                v_rname="",
+            )
+
+
+@dataclass(kw_only=True)
+class WanAttentionStruct(DiffusionAttentionStruct):
+    """WanAttention struct with special handling for add_k_proj/add_v_proj.
+
+    WanAttention has different semantics from standard attention:
+    - Self-attention (attn1): q/k/v from same input
+    - Cross-attention (attn2):
+      * q from hidden_states (video features)
+      * k/v from encoder_hidden_states (text features)
+      * add_k/add_v from image_encoder_hidden_states (image features)
+
+    For cross-attention, projections should be grouped as:
+    - q separately (attn_q_proj)
+    - k/v together (attn_kv_proj)
+    - add_k/add_v together (attn_add_kv_proj)
+
+    Note: Inherits from DiffusionAttentionStruct (not AttentionStruct) to ensure proper
+    smooth quantization handling in smooth_diffusion_layer.
+    """
+
+    # region relative keys
+    q_proj_rkey: tp.ClassVar[str] = "q_proj"
+    kv_proj_rkey: tp.ClassVar[str] = "kv_proj"
+    add_kv_proj_rkey: tp.ClassVar[str] = "add_kv_proj"
+    # endregion
+
+    # Store the add projections that aren't part of the main joint attention structure
+    internal_add_k_proj: nn.Linear | None = None
+    internal_add_v_proj: nn.Linear | None = None
+    internal_add_k_proj_rname: str = ""
+    internal_add_v_proj_rname: str = ""
+
+    # region absolute keys
+    q_proj_key: str = field(init=False, repr=False)
+    kv_proj_key: str = field(init=False, repr=False)
+    add_kv_proj_key: str = field(init=False, repr=False)
+    # endregion
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        # Initialize cross-attention specific keys
+        self.q_proj_key = join_name(self.key, self.q_proj_rkey, sep="_")
+        self.kv_proj_key = join_name(self.key, self.kv_proj_rkey, sep="_")
+        self.add_kv_proj_key = join_name(self.key, self.add_kv_proj_rkey, sep="_")
+
+    # region property overrides for WanAttention semantics
+
+    @property
+    def qkv_proj(self) -> list[nn.Linear]:
+        """Override qkv_proj for WanAttention.
+
+        For WanAttention cross-attention, projections come from different inputs and cannot
+        be smoothed together. Return empty list to skip the default qkv_proj smooth.
+        Individual projections will be handled through named_key_modules grouping.
+        """
+        if self.is_self_attn():
+            # Self-attention: q/k/v together
+            return [self.q_proj, self.k_proj, self.v_proj]
+        else:
+            # Cross-attention: return empty to skip qkv_proj smooth
+            # Each group (q, kv, add_kv) has different inputs and needs separate smooth
+            return []
+
+    @property
+    def add_qkv_proj(self) -> list[nn.Linear]:
+        """Override add_qkv_proj for WanAttention.
+
+        For WanAttention, add_k_proj/add_v_proj are stored as internal projections.
+        """
+        if self.is_self_attn():
+            return []
+        else:
+            # Cross-attention: return internal add_k/add_v projections
+            result = []
+            if self.internal_add_k_proj is not None:
+                result.append(self.internal_add_k_proj)
+            if self.internal_add_v_proj is not None:
+                result.append(self.internal_add_v_proj)
+            return result
+
+    # endregion
+
+    def is_self_attn(self) -> bool:
+        """Override for WanAttention semantics.
+
+        WanAttention self-attention: q/k/v from same input (may have internal_add_k/v_proj)
+        Standard check: add_k_proj is None AND (k_proj is not None OR is_cross_attn)
+
+        For WanAttention:
+        - has internal_add_k/v_proj -> not self-attention
+        - is cross-attention (module.is_cross_attention) -> not self-attention
+        """
+        # If has internal add projections, it's not pure self-attention
+        if self.internal_add_k_proj is not None or self.internal_add_v_proj is not None:
+            return False
+
+        # Check if this is a cross-attention based on the original module
+        # We stored this information during construction
+        if hasattr(self.module, 'is_cross_attention') and self.module.is_cross_attention:
+            return False
+
+        # Otherwise use the standard check
+        return super().is_self_attn()
+
+    def named_key_modules(self) -> tp.Generator[tp.Tuple[str, str, nn.Module, "BaseModuleStruct", str], None, None]:
+        """Yield modules with proper grouping keys for WanAttention.
+
+        For self-attention: q/k/v grouped as qkv_proj
+        For cross-attention:
+          - q separately as q_proj
+          - k/v together as kv_proj
+          - add_k/add_v together as add_kv_proj
+        """
+        if self.is_self_attn():
+            # Self-attention: use standard qkv grouping
+            yield from super().named_key_modules()
+        else:
+            # Cross-attention: separate grouping
+            # Q projection separately
+            yield self.q_proj_key, self.q_proj_name, self.q_proj, self, "q_proj"
+
+            # K/V projections together
+            if self.k_proj is not None:
+                yield self.kv_proj_key, self.k_proj_name, self.k_proj, self, "k_proj"
+            if self.v_proj is not None:
+                yield self.kv_proj_key, self.v_proj_name, self.v_proj, self, "v_proj"
+
+            # Add K/V projections together (for image conditioning)
+            if self.internal_add_k_proj is not None:
+                internal_add_k_name = join_name(self.name, self.internal_add_k_proj_rname)
+                yield self.add_kv_proj_key, internal_add_k_name, self.internal_add_k_proj, self, "internal_add_k_proj"
+            if self.internal_add_v_proj is not None:
+                internal_add_v_name = join_name(self.name, self.internal_add_v_proj_rname)
+                yield self.add_kv_proj_key, internal_add_v_name, self.internal_add_v_proj, self, "internal_add_v_proj"
+
+            # Output projection
+            yield self.out_proj_key, self.o_proj_name, self.o_proj, self, "o_proj"
 
 
 @dataclass(kw_only=True)
@@ -785,6 +1008,39 @@ class DiffusionTransformerBlockStruct(TransformerBlockStruct, DiffusionBlockStru
             add_ffn, add_ffn_rname = module.txt_mlp, "txt_mlp"
             mod, mod_rname = module.img_mod, "img_mod"
             add_mod, add_mod_rname = module.txt_mod, "txt_mod"
+        elif isinstance(module, WanTransformerBlock):
+            # Wan block structure:
+            # - norm1 + attn1 (self-attention)
+            # - attn2 (cross-attention) with optional norm2 (may be Identity)
+            # - norm3 + ffn
+            parallel = False
+            norm_type = add_norm_type = "layer_norm"
+            # Both attentions go into attns list
+            pre_attn_norms = [module.norm1]
+            pre_attn_norm_rnames = ["norm1"]
+            attns = [module.attn1]
+            attn_rnames = ["attn1"]
+            pre_attn_add_norms = [None]  # attn1 is self-attn, no add_norm
+            pre_attn_add_norm_rnames = [""]
+
+            if module.attn2 is not None:
+                # attn2 has no pre_norm (uses residual from attn1)
+                pre_attn_norms.append(None)
+                pre_attn_norm_rnames.append("")
+                attns.append(module.attn2)
+                attn_rnames.append("attn2")
+                # norm2 is the add_norm for attn2 (may be Identity)
+                if not isinstance(module.norm2, nn.Identity):
+                    pre_attn_add_norms.append(module.norm2)
+                    pre_attn_add_norm_rnames.append("norm2")
+                else:
+                    pre_attn_add_norms.append(None)
+                    pre_attn_add_norm_rnames.append("")
+
+            # FFN
+            pre_ffn_norm, pre_ffn_norm_rname = module.norm3, "norm3"
+            ffn, ffn_rname = module.ffn, "ffn"
+            pre_add_ffn_norm, pre_add_ffn_norm_rname, add_ffn, add_ffn_rname = None, "", None, ""
         else:
             raise NotImplementedError(f"Unsupported module type: {type(module)}")
         # mod is optional, only QwenImage has it
@@ -1846,6 +2102,13 @@ class DiTStruct(DiffusionModelStruct, DiffusionTransformerStruct):
                 norm_out, norm_out_rname = module.norm_out, "norm_out"
                 proj_out, proj_out_rname = module.proj_out, "proj_out"
                 transformer_blocks, transformer_blocks_rname = module.transformer_blocks, "transformer_blocks"
+            elif isinstance(module, WanTransformer3DModel):
+                input_embed, input_embed_rname = module.patch_embedding, "patch_embedding"
+                time_embed, time_embed_rname = module.condition_embedder, "condition_embedder"
+                text_embed, text_embed_rname = None, ""  # Wan uses combined time+text+image embedding
+                norm_out, norm_out_rname = module.norm_out, "norm_out"
+                proj_out, proj_out_rname = module.proj_out, "proj_out"
+                transformer_blocks, transformer_blocks_rname = module.blocks, "blocks"
             else:
                 raise NotImplementedError(f"Unsupported module type: {type(module)}")
             # text_norm is optional, only QwenImage has it
@@ -2078,7 +2341,7 @@ class FluxStruct(DiTStruct):
         return {k: v for k, v in key_map.items() if v}
 
 
-DiffusionAttentionStruct.register_factory((Attention, FluxAttention), DiffusionAttentionStruct._default_construct)
+DiffusionAttentionStruct.register_factory((Attention, FluxAttention, WanAttention), DiffusionAttentionStruct._default_construct)
 
 DiffusionFeedForwardStruct.register_factory(
     (FeedForward, FluxSingleTransformerBlock, GLUMBConv), DiffusionFeedForwardStruct._default_construct

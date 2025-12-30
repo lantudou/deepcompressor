@@ -4,7 +4,7 @@
 import random
 import typing as tp
 from collections import OrderedDict
-from dataclasses import MISSING, dataclass
+from dataclasses import _MISSING_TYPE, MISSING, dataclass
 
 import torch
 import torch.nn as nn
@@ -17,6 +17,13 @@ from diffusers.models.transformers.transformer_flux import (
     FluxTransformerBlock,
 )
 from diffusers.models.transformers.transformer_qwenimage import QwenImageTransformerBlock
+
+try:
+    from diffusers.models.transformers.transformer_wan import WanAttention, WanTransformerBlock
+except ImportError:
+    WanAttention = None
+    WanTransformerBlock = None
+
 from omniconfig import configclass
 
 from deepcompressor.data.cache import (
@@ -72,8 +79,6 @@ class DiffusionCalibCacheLoaderConfig(BaseDataLoaderConfig):
 
 
 class DiffusionCalibDataset(DiffusionDataset):
-    data: list[dict[str, tp.Any]]
-
     def __init__(self, path: str, num_samples: int = -1, seed: int = 0) -> None:
         super().__init__(path, num_samples=num_samples, seed=seed, ext=".pt")
         data = [torch.load(path) for path in self.filepaths]
@@ -88,6 +93,35 @@ class DiffusionCalibDataset(DiffusionDataset):
 
 
 class DiffusionConcatCacheAction(ConcatCacheAction):
+    def apply(
+        self,
+        name: str,
+        module: nn.Module,
+        tensors: dict[int | str, torch.Tensor],
+        cache: TensorsCache,
+    ) -> None:
+        """Concatenate cached activations along the sample dimension.
+
+        Args:
+            name (`str`):
+                Module name.
+            module (`nn.Module`):
+                Module.
+            tensors (`dict[int | str, torch.Tensor]`):
+                Tensors to cache.
+            cache (`TensorsCache`):
+                Cache.
+        """
+        # Handle None or MISSING encoder_hidden_states for WanAttention and Attention
+        if isinstance(module, (Attention, WanAttention)) if WanAttention is not None else isinstance(module, Attention):
+            encoder_hidden_states = tensors.get("encoder_hidden_states", None)
+            # Check if encoder_hidden_states is None or MISSING (for self-attention)
+            if encoder_hidden_states is None or isinstance(encoder_hidden_states, _MISSING_TYPE):
+                tensors.pop("encoder_hidden_states", None)
+                # Also remove from cache.tensors to prevent parent's apply from trying to process it
+                cache.tensors.pop("encoder_hidden_states", None)
+        return super().apply(name, module, tensors, cache)
+
     def info(
         self,
         name: str,
@@ -107,7 +141,7 @@ class DiffusionConcatCacheAction(ConcatCacheAction):
             cache (`TensorsCache`):
                 Cache.
         """
-        if isinstance(module, Attention):
+        if isinstance(module, (Attention, WanAttention)) if WanAttention is not None else isinstance(module, Attention):
             encoder_hidden_states = tensors.get("encoder_hidden_states", None)
             if encoder_hidden_states is None:
                 tensors.pop("encoder_hidden_states", None)
@@ -190,6 +224,19 @@ class DiffusionCalibCacheLoader(BaseCalibCacheLoader):
                 ),
                 outputs=TensorCache(),
             )
+        elif WanAttention is not None and isinstance(module, WanAttention):
+            # WanAttention: cache both hidden_states and encoder_hidden_states
+            # For cross-attention, we need both inputs
+            # hidden_states shape: [batch, seq_len, hidden_dim], channels_dim=-1
+            return IOTensorsCache(
+                inputs=TensorsCache(
+                    OrderedDict(
+                        hidden_states=TensorCache(channels_dim=-1),
+                        encoder_hidden_states=TensorCache(channels_dim=-1),
+                    ),
+                ),
+                outputs=TensorCache(channels_dim=-1),
+            )
         elif isinstance(module, Attention):
             return IOTensorsCache(
                 inputs=TensorsCache(
@@ -237,18 +284,61 @@ class DiffusionCalibCacheLoader(BaseCalibCacheLoader):
             assert len(args) == 0, f"Invalid args: {args}"
         else:
             hidden_states = args[0]
-        if isinstance(m, (FluxTransformerBlock, JointTransformerBlock, FluxSingleTransformerBlock, QwenImageTransformerBlock)):
+        block_types = (FluxTransformerBlock, JointTransformerBlock, FluxSingleTransformerBlock, QwenImageTransformerBlock)
+        if WanTransformerBlock is not None:
+            block_types = block_types + (WanTransformerBlock,)
+        if isinstance(m, block_types):
             if "encoder_hidden_states" in kwargs:
                 encoder_hidden_states = kwargs.pop("encoder_hidden_states")
             else:
                 encoder_hidden_states = args[1]
-            return ModuleForwardInput(
-                args=[
-                    hidden_states.detach().cpu() if save_all else MISSING,
-                    encoder_hidden_states.detach().cpu() if save_all else MISSING,
-                ],
-                kwargs=kwargs,
-            )
+
+            # WanTransformerBlock needs temb and rotary_emb
+            if WanTransformerBlock is not None and isinstance(m, WanTransformerBlock):
+                # Extract temb and rotary_emb from args or kwargs
+                if "temb" in kwargs:
+                    temb = kwargs.pop("temb")
+                else:
+                    temb = args[2] if len(args) > 2 else None
+
+                if "rotary_emb" in kwargs:
+                    rotary_emb = kwargs.pop("rotary_emb")
+                else:
+                    rotary_emb = args[3] if len(args) > 3 else None
+
+                # Process rotary_emb: it's a tuple of (cos, sin) tensors
+                if rotary_emb is not None and save_all:
+                    rotary_emb_cpu = tuple(t.detach().cpu() for t in rotary_emb)
+                else:
+                    rotary_emb_cpu = rotary_emb if rotary_emb is not None else MISSING
+
+                # IMPORTANT: For WanTransformerBlock, encoder_hidden_states is shared across blocks
+                # We need to save it on the first call (save_all=True) and reuse it later
+                # Don't use MISSING for encoder_hidden_states as it's not updated by previous layer outputs
+                if isinstance(encoder_hidden_states, _MISSING_TYPE):
+                    # If it's MISSING, keep it as MISSING (will be filtered in unpack)
+                    encoder_hidden_states_save = MISSING
+                else:
+                    # Save the actual tensor (even when save_all=False)
+                    encoder_hidden_states_save = encoder_hidden_states.detach().cpu() if encoder_hidden_states is not None else None
+
+                return ModuleForwardInput(
+                    args=[
+                        hidden_states.detach().cpu() if save_all else MISSING,
+                        encoder_hidden_states_save,
+                        temb.detach().cpu() if (save_all and temb is not None) else (temb if temb is not None else MISSING),
+                        rotary_emb_cpu,
+                    ],
+                    kwargs=kwargs,
+                )
+            else:
+                return ModuleForwardInput(
+                    args=[
+                        hidden_states.detach().cpu() if save_all else MISSING,
+                        encoder_hidden_states.detach().cpu() if save_all else MISSING,
+                    ],
+                    kwargs=kwargs,
+                )
         else:
             return ModuleForwardInput(
                 args=[hidden_states.detach().cpu() if save_all else MISSING, *args[1:]], kwargs=kwargs
@@ -267,7 +357,14 @@ class DiffusionCalibCacheLoader(BaseCalibCacheLoader):
             `dict[str | int, Any]`:
                 Dictionary for updating the next layer inputs.
         """
-        if isinstance(m, (FluxTransformerBlock, JointTransformerBlock, FluxSingleTransformerBlock, QwenImageTransformerBlock)):
+        # WanTransformerBlock only returns hidden_states (not a tuple)
+        if WanTransformerBlock is not None and isinstance(m, WanTransformerBlock):
+            assert isinstance(outputs, torch.Tensor)
+            return {0: outputs.detach().cpu()}
+
+        # Other blocks return (encoder_hidden_states, hidden_states) tuple
+        block_types = (FluxTransformerBlock, JointTransformerBlock, FluxSingleTransformerBlock, QwenImageTransformerBlock)
+        if isinstance(m, block_types):
             assert isinstance(outputs, tuple) and len(outputs) == 2
             encoder_hidden_states, hidden_states = outputs
             return {0: hidden_states.detach().cpu(), 1: encoder_hidden_states.detach().cpu()}
