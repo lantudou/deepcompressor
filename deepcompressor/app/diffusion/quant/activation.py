@@ -77,9 +77,22 @@ def quantize_diffusion_block_activations(  # noqa: C901
     used_modules: set[nn.Module] = set()
     for module_key, module_name, module, parent, field_name in layer.named_key_modules():
         modules, orig_struct_wgts = None, {}
-        if field_name in ("k_proj", "v_proj", "add_q_proj", "add_v_proj"):
+        # Special handling for WanAttention cross-attention
+        from ..nn.struct import WanAttentionStruct
+        is_wan_cross_attn = isinstance(parent, WanAttentionStruct) and parent.is_cross_attn()
+
+        if field_name in ("v_proj", "add_q_proj", "add_v_proj"):
+            # v_proj is handled with k_proj for WanAttention cross-attention
             continue
-        if field_name in ("q_proj", "add_k_proj", "up_proj"):
+        if field_name == "k_proj":
+            # For WanAttention cross-attention, k_proj needs special handling
+            if is_wan_cross_attn:
+                # Will be handled below
+                pass
+            else:
+                # Standard case: skip, handled with q_proj
+                continue
+        if field_name in ("q_proj", "k_proj", "add_k_proj", "up_proj"):
             grandparent = parent.parent
             assert isinstance(grandparent, DiffusionTransformerBlockStruct)
             if grandparent.parallel and parent.idx == 0:
@@ -91,10 +104,20 @@ def quantize_diffusion_block_activations(  # noqa: C901
                 if field_name == "q_proj":
                     assert isinstance(parent, DiffusionAttentionStruct)
                     assert module_name == parent.q_proj_name
-                    modules, module_names = parent.qkv_proj, parent.qkv_proj_names
+                    # For WanAttention cross-attention, Q is processed alone
+                    if is_wan_cross_attn:
+                        modules, module_names = [parent.q_proj], [parent.q_proj_name]
+                    else:
+                        modules, module_names = parent.qkv_proj, parent.qkv_proj_names
                     if grandparent.ffn_struct is not None:
                         modules.append(grandparent.ffn_struct.up_proj)
                         module_names.append(grandparent.ffn_struct.up_proj_name)
+                elif field_name == "k_proj":
+                    # WanAttention cross-attention: K/V share encoder_hidden_states input
+                    assert is_wan_cross_attn
+                    assert isinstance(parent, DiffusionAttentionStruct)
+                    assert module_name == parent.k_proj_name
+                    modules, module_names = [parent.k_proj, parent.v_proj], [parent.k_proj_name, parent.v_proj_name]
                 elif field_name == "add_k_proj":
                     assert isinstance(parent, DiffusionAttentionStruct)
                     assert module_name == parent.add_k_proj_name
@@ -119,7 +142,16 @@ def quantize_diffusion_block_activations(  # noqa: C901
                     }
                 if field_name == "q_proj":
                     assert module_name == parent.q_proj_name
-                    modules, module_names = parent.qkv_proj, parent.qkv_proj_names
+                    # For WanAttention cross-attention, Q is processed alone
+                    if is_wan_cross_attn:
+                        modules, module_names = [parent.q_proj], [parent.q_proj_name]
+                    else:
+                        modules, module_names = parent.qkv_proj, parent.qkv_proj_names
+                elif field_name == "k_proj":
+                    # WanAttention cross-attention: K/V share encoder_hidden_states input
+                    assert is_wan_cross_attn
+                    assert module_name == parent.k_proj_name
+                    modules, module_names = [parent.k_proj, parent.v_proj], [parent.k_proj_name, parent.v_proj_name]
                 else:
                     assert field_name == "add_k_proj"
                     assert module_name == parent.add_k_proj_name

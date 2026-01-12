@@ -97,6 +97,9 @@ class DiffusionEvalConfig:
     control_root: str | None = None
     negative_prompt : str = ""
     txt_seq_lens : int | None = None
+    num_frames: int = 81  # For I2V generation
+    image_path: str | None = None  # For I2V input image
+    transformer_stage: str | None = None  # For Wan I2V two-stage quantization ("high_noise" or "low_noise")
     chunk_start: int = 0
     chunk_step: int = 1
     chunk_only: bool = False
@@ -120,6 +123,8 @@ class DiffusionEvalConfig:
             kwargs["num_inference_steps"] = self.num_steps
         if self.guidance_scale is not None:
             kwargs["guidance_scale"] = self.guidance_scale
+        if self.num_frames is not None:
+            kwargs["num_frames"] = self.num_frames
         return kwargs
 
     def _generate(

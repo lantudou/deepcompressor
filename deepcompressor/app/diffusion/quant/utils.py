@@ -50,11 +50,28 @@ def get_needs_inputs_fn(
                 if field_name.endswith("o_proj"):
                     needs_inputs_names.add(module_name)
                 elif field_name in ("q_proj", "k_proj", "v_proj"):
-                    needs_inputs_names.add(parent.q_proj_name)
-                    if parent.parent.parallel and parent.idx == 0:
-                        needs_inputs_names.add(parent.parent.name)
+                    # For WanAttention cross-attention, Q/K/V have different input sources
+                    from ..nn.struct import WanAttentionStruct
+                    if isinstance(parent, WanAttentionStruct) and parent.is_cross_attn():
+                        # Cross-attention: Q uses hidden_states, K/V use encoder_hidden_states
+                        if field_name == "q_proj":
+                            needs_inputs_names.add(parent.q_proj_name)  # Cache Q input
+                        elif field_name == "k_proj":
+                            needs_inputs_names.add(parent.k_proj_name)  # Cache K input (shared with V)
+                        # v_proj shares input with k_proj, no need to cache separately
+
+                        # Add attention module cache
+                        if parent.parent.parallel and parent.idx == 0:
+                            needs_inputs_names.add(parent.parent.name)
+                        else:
+                            needs_inputs_names.add(parent.name)
                     else:
-                        needs_inputs_names.add(parent.name)
+                        # Self-attention or standard attention: Q/K/V share input
+                        needs_inputs_names.add(parent.q_proj_name)
+                        if parent.parent.parallel and parent.idx == 0:
+                            needs_inputs_names.add(parent.parent.name)
+                        else:
+                            needs_inputs_names.add(parent.name)
                 elif field_name in ("add_q_proj", "add_k_proj", "add_v_proj"):
                     needs_inputs_names.add(parent.add_k_proj_name)
                     if parent.parent.parallel and parent.idx == 0:

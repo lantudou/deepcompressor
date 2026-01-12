@@ -458,9 +458,15 @@ class DiffusionCalibCacheLoader(BaseCalibCacheLoader):
                     for attn_struct in transformer_block_struct.iter_attention_structs():
                         if attn_struct.q_proj_name in layer_cache:
                             if not attn_struct.is_cross_attn():
+                                # Self-attention: Q/K/V share hidden_states input
                                 cache = layer_cache[attn_struct.q_proj_name]
                                 layer_cache[attn_struct.k_proj_name] = cache
                                 layer_cache[attn_struct.v_proj_name] = cache
+                        # For WanAttention cross-attention, K/V use k_proj_name cache
+                        if attn_struct.k_proj_name in layer_cache and attn_struct.is_cross_attn():
+                            # Cross-attention (WanAttention): K/V share encoder_hidden_states input
+                            cache = layer_cache[attn_struct.k_proj_name]
+                            layer_cache[attn_struct.v_proj_name] = cache
                         if attn_struct.add_k_proj_name in layer_cache:
                             assert not attn_struct.is_self_attn()
                             cache = layer_cache[attn_struct.add_k_proj_name]

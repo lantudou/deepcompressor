@@ -567,6 +567,166 @@ def convert_to_nunchaku_qwenimage_state_dicts(
     return converted, other
 
 
+def convert_to_nunchaku_wan2_transformer_block_state_dict(
+    state_dict: dict[str, torch.Tensor],
+    scale_dict: dict[str, torch.Tensor],
+    smooth_dict: dict[str, torch.Tensor],
+    branch_dict: dict[str, torch.Tensor],
+    block_name: str,
+    float_point: bool = False,
+) -> dict[str, torch.Tensor]:
+    """Convert a WAN2 transformer block to Nunchaku format.
+
+    WAN2 I2V architecture layer mapping:
+    - blocks.N.attn1: Self-attention (q/k/v from same input)
+      * attn1.to_q/to_k/to_v → attn1.to_qkv (merged)
+      * attn1.to_out.0 → attn1.to_out.0
+      * attn1.norm_q/norm_k → copied directly (non-quantized)
+    - blocks.N.attn2: Cross-attention (q from hidden_states, k/v from encoder_hidden_states)
+      * attn2.to_q → attn2.to_q (alone, different input source)
+      * attn2.to_k/to_v → attn2.to_kv (merged, share encoder_hidden_states input)
+      * attn2.to_out.0 → attn2.to_out.0
+      * attn2.norm_q/norm_k → copied directly (non-quantized)
+    - blocks.N.ffn: Feed-forward
+      * ffn.net.0.proj → ffn.net.0.proj (up projection)
+      * ffn.net.2.linear → ffn.net.2.linear (down projection, has shift)
+    - blocks.N.norm2: Layer norm (non-quantized, copied directly)
+    - blocks.N.scale_shift_table: Modulation parameters (non-quantized)
+    """
+    # Handle potential .linear suffix variations in FFN down projection
+    ffn_down_proj_local_name = "ffn.net.2.linear"
+    if f"{block_name}.{ffn_down_proj_local_name}.weight" not in state_dict:
+        ffn_down_proj_local_name = "ffn.net.2"
+        assert f"{block_name}.{ffn_down_proj_local_name}.weight" in state_dict
+
+    # First, handle non-quantized parameters that don't follow .weight/.bias convention
+    converted: dict[str, torch.Tensor] = {}
+
+    # Copy scale_shift_table directly (AdaLN modulation parameter)
+    scale_shift_table_key = f"{block_name}.scale_shift_table"
+    if scale_shift_table_key in state_dict:
+        converted["scale_shift_table"] = state_dict[scale_shift_table_key].clone().cpu()
+
+    # Copy norm2 (layer norm with weight and bias)
+    norm2_weight_key = f"{block_name}.norm2.weight"
+    norm2_bias_key = f"{block_name}.norm2.bias"
+    if norm2_weight_key in state_dict:
+        converted["norm2.weight"] = state_dict[norm2_weight_key].clone().cpu()
+    if norm2_bias_key in state_dict:
+        converted["norm2.bias"] = state_dict[norm2_bias_key].clone().cpu()
+
+    # Now convert quantized layers using the standard function
+    quantized_converted = convert_to_nunchaku_transformer_block_state_dict(
+        state_dict=state_dict,
+        scale_dict=scale_dict,
+        smooth_dict=smooth_dict,
+        branch_dict=branch_dict,
+        block_name=block_name,
+        local_name_map={
+            # Self-attention (attn1): Q/K/V merged together
+            "attn1.to_qkv": ["attn1.to_q", "attn1.to_k", "attn1.to_v"],
+            "attn1.norm_q": "attn1.norm_q",
+            "attn1.norm_k": "attn1.norm_k",
+            "attn1.to_out.0": "attn1.to_out.0",
+            # Cross-attention (attn2): Q alone, K/V merged
+            "attn2.to_q": "attn2.to_q",
+            "attn2.to_kv": ["attn2.to_k", "attn2.to_v"],
+            "attn2.norm_q": "attn2.norm_q",
+            "attn2.norm_k": "attn2.norm_k",
+            "attn2.to_out.0": "attn2.to_out.0",
+            # Feed-forward
+            "ffn.net.0.proj": "ffn.net.0.proj",
+            "ffn.net.2.linear": ffn_down_proj_local_name,
+        },
+        smooth_name_map={
+            # Self-attention smooth: Q is the reference for QKV
+            "attn1.to_qkv": "attn1.to_q",
+            "attn1.to_out.0": "attn1.to_out.0",
+            # Cross-attention smooth: Q alone, K is the reference for KV
+            "attn2.to_q": "attn2.to_q",
+            "attn2.to_kv": "attn2.to_k",
+            "attn2.to_out.0": "attn2.to_out.0",
+            # FFN smooth
+            "ffn.net.0.proj": "ffn.net.0.proj",
+            "ffn.net.2.linear": ffn_down_proj_local_name,
+        },
+        branch_name_map={
+            # Self-attention branch
+            "attn1.to_qkv": "attn1.to_q",
+            "attn1.to_out.0": "attn1.to_out.0",
+            # Cross-attention branch
+            "attn2.to_q": "attn2.to_q",
+            "attn2.to_kv": "attn2.to_k",
+            "attn2.to_out.0": "attn2.to_out.0",
+            # FFN branch
+            "ffn.net.0.proj": "ffn.net.0.proj",
+            "ffn.net.2.linear": ffn_down_proj_local_name,
+        },
+        convert_map={
+            # All quantized layers use W4A4 linear
+            "attn1.to_qkv": "linear",
+            "attn1.to_out.0": "linear",
+            "attn2.to_q": "linear",
+            "attn2.to_kv": "linear",
+            "attn2.to_out.0": "linear",
+            "ffn.net.0.proj": "linear",
+            "ffn.net.2.linear": "linear",
+        },
+        float_point=float_point,
+    )
+
+    # Merge the non-quantized parameters with the quantized ones
+    converted.update(quantized_converted)
+    return converted
+
+
+def convert_to_nunchaku_wan2_state_dicts(
+    state_dict: dict[str, torch.Tensor],
+    scale_dict: dict[str, torch.Tensor],
+    smooth_dict: dict[str, torch.Tensor],
+    branch_dict: dict[str, torch.Tensor],
+    float_point: bool = False,
+) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+    """Convert WAN2 model state dict to Nunchaku format.
+
+    WAN2 I2V structure:
+    - blocks.N: WanTransformerBlock (attn1, attn2, ffn, norms)
+
+    Non-quantized layers (directly copied):
+    - time_embed, time_proj, text_embed: Time and text embeddings
+    - img_embed: Image embedding (for I2V)
+    - patch_embed: Patch embedding
+    - head: Output head
+    - norm1, norm2, norm3: Block layer norms
+    - norm_q, norm_k: Attention QK norms
+    - scale_shift_table: Modulation parameters
+    """
+    block_names: set[str] = set()
+    other: dict[str, torch.Tensor] = {}
+    for param_name in state_dict.keys():
+        if param_name.startswith("blocks."):
+            block_names.add(".".join(param_name.split(".")[:2]))
+        else:
+            other[param_name] = state_dict[param_name]
+    block_names = sorted(block_names, key=lambda x: int(x.split(".")[-1]))
+    print(f"Converting {len(block_names)} WAN2 transformer blocks...")
+    converted: dict[str, torch.Tensor] = {}
+    for block_name in block_names:
+        update_state_dict(
+            converted,
+            convert_to_nunchaku_wan2_transformer_block_state_dict(
+                state_dict=state_dict,
+                scale_dict=scale_dict,
+                smooth_dict=smooth_dict,
+                branch_dict=branch_dict,
+                block_name=block_name,
+                float_point=float_point,
+            ),
+            prefix=block_name,
+        )
+    return converted, other
+
+
 def _detect_model_type(model_name: str) -> str:
     """Detect the model type from the model name.
 
@@ -574,7 +734,7 @@ def _detect_model_type(model_name: str) -> str:
         model_name: The model name string.
 
     Returns:
-        The detected model type: "flux" or "qwenimage".
+        The detected model type: "flux", "qwenimage", or "wan2".
 
     Raises:
         ValueError: If the model type cannot be detected.
@@ -584,10 +744,12 @@ def _detect_model_type(model_name: str) -> str:
         return "qwenimage"
     elif "flux" in model_name_lower:
         return "flux"
+    elif "wan" in model_name_lower:
+        return "wan2"
     else:
         raise ValueError(
             f"Cannot detect model type from model name '{model_name}'. "
-            "Supported model types: 'flux', 'qwenimage' (or 'qwen-image', 'qwen2vl')."
+            "Supported model types: 'flux', 'qwenimage' (or 'qwen-image', 'qwen2vl'), 'wan2' (or 'wan')."
         )
 
 
@@ -625,6 +787,8 @@ if __name__ == "__main__":
     # Select conversion function based on model type
     if model_type == "qwenimage":
         convert_fn = convert_to_nunchaku_qwenimage_state_dicts
+    elif model_type == "wan2":
+        convert_fn = convert_to_nunchaku_wan2_state_dicts
     else:
         convert_fn = convert_to_nunchaku_flux_state_dicts
 

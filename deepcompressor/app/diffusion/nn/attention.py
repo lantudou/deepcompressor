@@ -22,6 +22,11 @@ except ImportError:
     QwenDoubleStreamAttnProcessor2_0 = None
     apply_rotary_emb_qwen = None
 
+try:
+    from diffusers.models.transformers.transformer_wan import WanAttnProcessor
+except ImportError:
+    WanAttnProcessor = None
+
 from deepcompressor.nn.patch.sdpa import ScaleDotProductAttention
 
 __all__ = ["DiffusionAttentionProcessor"]
@@ -52,6 +57,9 @@ class DiffusionAttentionProcessor(nn.Module):
         elif QwenDoubleStreamAttnProcessor2_0 is not None and isinstance(orig, QwenDoubleStreamAttnProcessor2_0):
             # QwenDoubleStreamAttnProcessor2_0 uses its own RoPE implementation
             self.rope = "qwen"
+        elif WanAttnProcessor is not None and isinstance(orig, WanAttnProcessor):
+            # WanAttnProcessor uses Flux-style RoPE
+            self.rope = apply_flux_rope
         elif isinstance(orig, (AttnProcessor2_0, JointAttnProcessor2_0)):
             self.rope = None
         else:

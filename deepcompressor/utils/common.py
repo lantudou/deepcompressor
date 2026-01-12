@@ -134,7 +134,14 @@ def tree_copy_with_ref(
         return type(tree)(tree_copy_with_ref(v, ref[i]) for i, v in enumerate(tree))
     elif isinstance(tree, torch.Tensor):
         assert isinstance(ref, torch.Tensor), f"source is a tensor but reference is not: {type(ref)}"
-        assert tree.shape == ref.shape, f"source.shape={tree.shape} != reference.shape={ref.shape}"
+        # Allow batch dimension mismatch when tree has been deduplicated (tree.shape[0]=1, ref.shape[0]>1)
+        # This happens when tree_collate deduplicates identical tensors in a batch
+        if tree.shape != ref.shape:
+            if tree.shape[0] == 1 and ref.shape[0] > 1 and tree.shape[1:] == ref.shape[1:]:
+                # tree is deduplicated, use ref (which has the full batch)
+                return ref
+            else:
+                raise AssertionError(f"source.shape={tree.shape} != reference.shape={ref.shape}")
         if tree.data_ptr() == ref.data_ptr() or tree.allclose(ref):
             return ref
         else:

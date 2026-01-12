@@ -642,6 +642,44 @@ class WanAttentionStruct(DiffusionAttentionStruct):
         # Otherwise use the standard check
         return super().is_self_attn()
 
+    def is_cross_attn(self) -> bool:
+        """Override for WanAttention semantics.
+
+        For WanAttention, cross-attention is identified by:
+        1. Has k_proj (standard cross-attention has k_proj)
+        2. Does NOT have add projections (neither internal_add_k_proj nor add_k_proj)
+        3. Is marked as cross-attention on the module
+
+        This handles the case where WanAttention is used for standard cross-attention
+        without additional image conditioning.
+        """
+        # Check if module is marked as cross-attention
+        if hasattr(self.module, 'is_cross_attention') and self.module.is_cross_attention:
+            # Has k_proj but no add projections -> pure cross-attention
+            has_k_proj = self.k_proj is not None
+            has_no_add_proj = (self.internal_add_k_proj is None) and (self.add_k_proj is None)
+            if has_k_proj and has_no_add_proj:
+                return True
+
+        # Otherwise use the standard check (k_proj is None)
+        return super().is_cross_attn()
+
+    def is_joint_attn(self) -> bool:
+        """Override for WanAttention semantics.
+
+        For WanAttention, we check both internal_add_k_proj (WanAttention-specific)
+        and add_k_proj (standard). A WanAttention is considered joint attention
+        if it has k_proj and either internal_add_k_proj or add_k_proj.
+
+        Standard joint attention: has both k_proj and add_k_proj
+        WanAttention joint attention: has both k_proj and (internal_add_k_proj or add_k_proj)
+        """
+        # Check for add projections (either WanAttention-specific or standard)
+        has_add_proj = (self.internal_add_k_proj is not None) or (self.add_k_proj is not None)
+        has_k_proj = self.k_proj is not None
+
+        return has_add_proj and has_k_proj
+
     def named_key_modules(self) -> tp.Generator[tp.Tuple[str, str, nn.Module, "BaseModuleStruct", str], None, None]:
         """Yield modules with proper grouping keys for WanAttention.
 

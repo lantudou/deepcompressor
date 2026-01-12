@@ -59,17 +59,55 @@ def calibrate_diffusion_block_low_rank_branch(  # noqa: C901
                     else:
                         continue
                 elif parent.is_cross_attn():
-                    if field_name == "add_k_proj":
-                        modules.append(parent.add_v_proj)
-                        module_names.append(parent.add_v_proj_name)
-                    elif field_name != "q_proj":
-                        continue
+                    # For WanAttention cross-attention: Q uses hidden_states, K/V use encoder_hidden_states
+                    # Q should be handled separately, K/V should be grouped together
+                    from ..nn.struct import WanAttentionStruct
+                    if isinstance(parent, WanAttentionStruct):
+                        if field_name == "q_proj":
+                            # Q proj handles hidden_states input, process alone
+                            pass  # modules = [module], module_names = [module_name]
+                        elif field_name == "k_proj":
+                            # K/V share encoder_hidden_states input, group them together
+                            modules = [parent.k_proj, parent.v_proj]
+                            module_names = [parent.k_proj_name, parent.v_proj_name]
+                        elif field_name == "v_proj":
+                            # Skip v since it's handled with k
+                            continue
+                        else:
+                            continue
+                    else:
+                        # Standard cross-attention handling
+                        if field_name == "add_k_proj":
+                            modules.append(parent.add_v_proj)
+                            module_names.append(parent.add_v_proj_name)
+                        elif field_name != "q_proj":
+                            continue
                 else:
                     assert parent.is_joint_attn()
                     if field_name == "q_proj":
-                        modules, module_names = parent.qkv_proj, parent.qkv_proj_names
-                    elif field_name == "add_k_proj":
+                        # For WanAttention cross-attention, qkv_proj is empty (different input sources)
+                        # In this case, just process q_proj individually
+                        if len(parent.qkv_proj) == 0:
+                            # WanAttention cross-attention: keep q_proj alone
+                            pass  # modules and module_names already set to [module], [module_name]
+                        else:
+                            # Standard joint attention: group qkv together
+                            modules, module_names = parent.qkv_proj, parent.qkv_proj_names
+                    elif field_name == "add_k_proj" or field_name == "internal_add_k_proj":
+                        # Handle both standard add_k_proj and WanAttention's internal_add_k_proj
                         modules, module_names = parent.add_qkv_proj, parent.add_qkv_proj_names
+                    elif field_name == "k_proj":
+                        # For WanAttention cross-attention, k/v should be grouped together
+                        # Check if this is WanAttention with separate k/v handling
+                        if len(parent.qkv_proj) == 0 and parent.k_proj is not None and parent.v_proj is not None:
+                            # WanAttention cross-attention: group k and v together
+                            modules = [parent.k_proj, parent.v_proj]
+                            module_names = [parent.k_proj_name, parent.v_proj_name]
+                        else:
+                            continue
+                    elif field_name == "v_proj":
+                        # Skip v_proj if we already handled it with k_proj
+                        continue
                     else:
                         continue
         if field_name.endswith(("q_proj", "k_proj")):

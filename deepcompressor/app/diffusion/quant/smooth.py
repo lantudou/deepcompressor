@@ -19,6 +19,7 @@ from ..nn.struct import (
     DiffusionFeedForwardStruct,
     DiffusionModelStruct,
     DiffusionTransformerBlockStruct,
+    WanAttentionStruct,
 )
 from .config import DiffusionQuantConfig
 from .utils import get_needs_inputs_fn, wrap_joint_attn
@@ -51,48 +52,117 @@ def smooth_diffusion_qkv_proj(
     block_kwargs: dict[str, tp.Any] | None = None,
 ) -> dict[str, torch.Tensor]:
     logger = tools.logging.getLogger(f"{__name__}.SmoothQuant")
-    # region qkv projection
-    module_key = attn.qkv_proj_key
-    needs_quant = config.enabled_wgts and config.wgts.is_enabled_for(module_key)
-    needs_quant = needs_quant or (config.enabled_ipts and config.ipts.is_enabled_for(module_key))
-    if needs_quant and config.smooth.enabled_proj and config.smooth.proj.is_enabled_for(module_key):
-        logger.debug("- %s.qkv_proj", attn.name)
-        prevs = None
-        if config.smooth.proj.fuse_when_possible and attn.parent.norm_type.startswith("layer_norm"):
-            if not hasattr(attn.parent.module, "pos_embed") or attn.parent.module.pos_embed is None:
-                prevs = attn.parent.pre_attn_norms[attn.idx]
-                assert isinstance(prevs, nn.LayerNorm)
-        cache_key = attn.q_proj_name
-        config_wgts = config.wgts
-        if config.enabled_extra_wgts and config.extra_wgts.is_enabled_for(module_key):
-            config_wgts = config.extra_wgts
-        smooth_cache[cache_key] = smooth_linear_modules(
-            prevs,
-            attn.qkv_proj,
-            scale=smooth_cache.get(cache_key, None),
-            config=config.smooth.proj,
-            weight_quantizer=Quantizer(config_wgts, key=module_key, low_rank=config.wgts.low_rank),
-            input_quantizer=Quantizer(config.ipts, channels_dim=-1, key=module_key),
-            inputs=block_cache[attn.q_proj_name].inputs if block_cache else None,
-            eval_inputs=block_cache[attn.name].inputs if block_cache else None,
-            eval_module=attn,
-            eval_kwargs=attn.filter_kwargs(block_kwargs),
-            develop_dtype=config.develop_dtype,
-        )
-        if prevs is None:
-            # we need to register forward pre hook to smooth inputs
-            group_norm = getattr(attn.module, "group_norm", None)
-            spatial_norm = getattr(attn.module, "spatial_norm", None)
-            if group_norm is None and spatial_norm is None:
-                ActivationSmoother(
-                    smooth_cache[cache_key],
-                    channels_dim=-1,
-                    input_packager=KeyedInputPackager(attn.module, [0]),
-                ).as_hook().register(attn.module)
-            else:
-                ActivationSmoother(smooth_cache[cache_key], channels_dim=-1).as_hook().register(attn.qkv_proj)
-        for m in attn.qkv_proj:
-            m.in_smooth_cache_key = cache_key
+
+    # Special handling for WanAttention cross-attention
+    if isinstance(attn, WanAttentionStruct) and not attn.is_self_attn():
+        # For WanAttention cross-attention, we need to smooth Q, K/V separately
+        # since they come from different input sources:
+        # - Q from hidden_states (video features)
+        # - K/V from encoder_hidden_states (text features)
+
+        # Smooth Q projection separately
+        module_key = attn.q_proj_key
+        needs_quant = config.enabled_wgts and config.wgts.is_enabled_for(module_key)
+        needs_quant = needs_quant or (config.enabled_ipts and config.ipts.is_enabled_for(module_key))
+        if needs_quant and config.smooth.enabled_proj and config.smooth.proj.is_enabled_for(module_key):
+            logger.debug("- %s.q_proj (WanAttention cross-attn)", attn.name)
+            prevs = None
+            if config.smooth.proj.fuse_when_possible and attn.parent.norm_type.startswith("layer_norm"):
+                if not hasattr(attn.parent.module, "pos_embed") or attn.parent.module.pos_embed is None:
+                    prevs = attn.parent.pre_attn_norms[attn.idx]
+                    assert isinstance(prevs, nn.LayerNorm)
+            cache_key = attn.q_proj_name
+            config_wgts = config.wgts
+            if config.enabled_extra_wgts and config.extra_wgts.is_enabled_for(module_key):
+                config_wgts = config.extra_wgts
+            smooth_cache[cache_key] = smooth_linear_modules(
+                prevs,
+                [attn.q_proj],
+                scale=smooth_cache.get(cache_key, None),
+                config=config.smooth.proj,
+                weight_quantizer=Quantizer(config_wgts, key=module_key, low_rank=config.wgts.low_rank),
+                input_quantizer=Quantizer(config.ipts, channels_dim=-1, key=module_key),
+                inputs=block_cache[attn.q_proj_name].inputs if block_cache else None,
+                eval_inputs=block_cache[attn.q_proj_name].inputs if block_cache else None,
+                eval_module=attn.q_proj,
+                develop_dtype=config.develop_dtype,
+            )
+            if prevs is None:
+                ActivationSmoother(smooth_cache[cache_key], channels_dim=-1).as_hook().register(attn.q_proj)
+            attn.q_proj.in_smooth_cache_key = cache_key
+
+        # Smooth K/V projections together (from encoder_hidden_states)
+        module_key = attn.kv_proj_key
+        needs_quant = config.enabled_wgts and config.wgts.is_enabled_for(module_key)
+        needs_quant = needs_quant or (config.enabled_ipts and config.ipts.is_enabled_for(module_key))
+        if needs_quant and config.smooth.enabled_proj and config.smooth.proj.is_enabled_for(module_key):
+            logger.debug("- %s.kv_proj (WanAttention cross-attn)", attn.name)
+            # K/V come from encoder_hidden_states, use k_proj's input cache
+            cache_key = attn.k_proj_name
+            config_wgts = config.wgts
+            if config.enabled_extra_wgts and config.extra_wgts.is_enabled_for(module_key):
+                config_wgts = config.extra_wgts
+            smooth_cache[cache_key] = smooth_linear_modules(
+                None,  # No prevs for encoder_hidden_states
+                [attn.k_proj, attn.v_proj],
+                scale=smooth_cache.get(cache_key, None),
+                config=config.smooth.proj,
+                weight_quantizer=Quantizer(config_wgts, key=module_key, low_rank=config.wgts.low_rank),
+                input_quantizer=Quantizer(config.ipts, channels_dim=-1, key=module_key),
+                inputs=block_cache[attn.k_proj_name].inputs if block_cache else None,
+                eval_inputs=block_cache[attn.k_proj_name].inputs if block_cache else None,
+                eval_module=attn.k_proj,
+                develop_dtype=config.develop_dtype,
+            )
+            # Register hook to smooth K/V inputs
+            ActivationSmoother(smooth_cache[cache_key], channels_dim=-1).as_hook().register([attn.k_proj, attn.v_proj])
+            attn.k_proj.in_smooth_cache_key = cache_key
+            attn.v_proj.in_smooth_cache_key = cache_key
+
+        # add_K/add_V are handled by the existing add_qkv_proj logic below
+    else:
+        # Standard qkv projection handling (for non-WanAttention or self-attention)
+        module_key = attn.qkv_proj_key
+        needs_quant = config.enabled_wgts and config.wgts.is_enabled_for(module_key)
+        needs_quant = needs_quant or (config.enabled_ipts and config.ipts.is_enabled_for(module_key))
+        if needs_quant and config.smooth.enabled_proj and config.smooth.proj.is_enabled_for(module_key):
+            logger.debug("- %s.qkv_proj", attn.name)
+            prevs = None
+            if config.smooth.proj.fuse_when_possible and attn.parent.norm_type.startswith("layer_norm"):
+                if not hasattr(attn.parent.module, "pos_embed") or attn.parent.module.pos_embed is None:
+                    prevs = attn.parent.pre_attn_norms[attn.idx]
+                    assert isinstance(prevs, nn.LayerNorm)
+            cache_key = attn.q_proj_name
+            config_wgts = config.wgts
+            if config.enabled_extra_wgts and config.extra_wgts.is_enabled_for(module_key):
+                config_wgts = config.extra_wgts
+            smooth_cache[cache_key] = smooth_linear_modules(
+                prevs,
+                attn.qkv_proj,
+                scale=smooth_cache.get(cache_key, None),
+                config=config.smooth.proj,
+                weight_quantizer=Quantizer(config_wgts, key=module_key, low_rank=config.wgts.low_rank),
+                input_quantizer=Quantizer(config.ipts, channels_dim=-1, key=module_key),
+                inputs=block_cache[attn.q_proj_name].inputs if block_cache else None,
+                eval_inputs=block_cache[attn.name].inputs if block_cache else None,
+                eval_module=attn,
+                eval_kwargs=attn.filter_kwargs(block_kwargs),
+                develop_dtype=config.develop_dtype,
+            )
+            if prevs is None:
+                # we need to register forward pre hook to smooth inputs
+                group_norm = getattr(attn.module, "group_norm", None)
+                spatial_norm = getattr(attn.module, "spatial_norm", None)
+                if group_norm is None and spatial_norm is None:
+                    ActivationSmoother(
+                        smooth_cache[cache_key],
+                        channels_dim=-1,
+                        input_packager=KeyedInputPackager(attn.module, [0]),
+                    ).as_hook().register(attn.module)
+                else:
+                    ActivationSmoother(smooth_cache[cache_key], channels_dim=-1).as_hook().register(attn.qkv_proj)
+            for m in attn.qkv_proj:
+                m.in_smooth_cache_key = cache_key
     # endregion
     if attn.is_self_attn():
         return smooth_cache

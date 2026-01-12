@@ -1,6 +1,6 @@
 quant:
   smooth:
     proj:
-      num_grids: 10
+      num_grids: 5
   calib:
     num_samples: 64

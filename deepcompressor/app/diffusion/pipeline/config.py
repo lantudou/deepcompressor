@@ -30,6 +30,7 @@ from ..nn.patch import (
     shift_input_activations,
 )
 from ..qwenimage import QwenImagePipelineWithSeqLen as QwenImagePipeline
+from ..wan_i2v import WanImageToVideoPipelineForQuant
 #from diffusers.pipelines.qwenimage import QwenImagePipeline
 __all__ = ["DiffusionPipelineConfig"]
 
@@ -347,6 +348,8 @@ class DiffusionPipelineConfig:
                 path = "black-forest-labs/FLUX.1-schnell"
             elif name.startswith("qwenimage"):
                 path = "Qwen/Qwen-Image"
+            elif name == "wan2-i2v":
+                path = "Wan-AI/Wan2.2-I2V-A14B-Diffusers"
             else:
                 raise ValueError(f"Path for {name} is not specified.")
         if name in ["flux.1-canny-dev", "flux.1-depth-dev"]:
@@ -362,6 +365,8 @@ class DiffusionPipelineConfig:
                 pipeline = SanaPipeline.from_pretrained(path, torch_dtype=dtype)
         elif name.startswith("qwenimage"):
             pipeline = QwenImagePipeline.from_pretrained(path, torch_dtype=dtype)
+        elif name == "wan2-i2v":
+            pipeline = WanImageToVideoPipelineForQuant.from_pretrained(path, torch_dtype=dtype)
         else:
             pipeline = AutoPipelineForText2Image.from_pretrained(path, torch_dtype=dtype)
         pipeline = pipeline.to(device)

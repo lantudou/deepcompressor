@@ -418,7 +418,6 @@ def main(config: DiffusionPtqRunConfig, logging_level: int = tools.logging.DEBUG
                 num_inference_steps=50,
                 true_cfg_scale=4.0,
                 generator=generator,
-                target_seq_len=target_seq_len,  # Use the configurable parameter
             ).images[0]
             image.save("qwen-image-test.png")
     else:

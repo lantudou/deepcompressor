@@ -2,6 +2,11 @@ import torch.nn as nn
 from diffusers.models.attention_processor import Attention
 from diffusers.models.transformers.transformer_flux import FluxAttention, FluxSingleTransformerBlock
 
+try:
+    from diffusers.models.transformers.transformer_wan import WanAttention
+except ImportError:
+    WanAttention = None
+
 from deepcompressor.nn.patch.conv import ConcatConv2d, ShiftedConv2d
 from deepcompressor.nn.patch.linear import ConcatLinear, ShiftedLinear
 from deepcompressor.utils import patch, tools
@@ -111,8 +116,11 @@ def replace_attn_processor(model: nn.Module) -> None:
     logger = tools.logging.getLogger(__name__)
     logger.info("Replacing Attention processors.")
     tools.logging.Formatter.indent_inc()
+    attn_types = (Attention, FluxAttention)
+    if WanAttention is not None:
+        attn_types = attn_types + (WanAttention,)
     for name, module in model.named_modules():
-        if isinstance(module, (Attention, FluxAttention)):
+        if isinstance(module, attn_types):
             logger.info(f"+ Replacing {name} processor with DiffusionAttentionProcessor.")
             module.set_processor(DiffusionAttentionProcessor(module.processor))
     tools.logging.Formatter.indent_dec()
