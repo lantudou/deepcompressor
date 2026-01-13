@@ -27,8 +27,7 @@
 Before quantizing diffusion models, prepare the calibration dataset:
 
 ```bash
-python -m deepcompressor.app.diffusion.dataset.collect.calib \
-    configs/model/flux.1-schnell.yaml configs/collect/qdiff.yaml
+python -m deepcompressor.app.diffusion.dataset.collect.calib
 ```
 
 ### Step 2: Model Quantization
@@ -40,6 +39,17 @@ python -m deepcompressor.app.diffusion.ptq
 ```
 
 > **Note**: When quantizing **Qwen-Image** models, you **must** use the `examples/diffusion/configs/svdquant/gptq.yaml` configuration. Without GPTQ, the `AWQW4A16Linear` layers will suffer significant precision loss, severely degrading image generation quality.
+
+### Step 3: Convert to Nunchaku Format
+
+Convert the quantized model checkpoint to Nunchaku-compatible format for deployment:
+
+```bash
+python -m deepcompressor.backend.nunchaku.convert \
+  --quant-path /PATH/TO/CHECKPOINT/DIR \
+  --output-root /PATH/TO/OUTPUT/ROOT \
+  --model-name MODEL_NAME
+```
 
 For more detailed configurations, please refer to [examples/diffusion](/examples/diffusion/).
 
