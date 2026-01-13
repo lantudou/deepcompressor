@@ -16,6 +16,33 @@
     </a> -->
 </p>
 
+## Update
+
+- Updated `diffusers` dependency to `>= 0.36.0` and `torch` to `>= 2.8.0` for compatibility with the latest versions.
+
+## Quick Start (Diffusion Model Quantization)
+
+### Step 1: Calibration Dataset Preparation
+
+Before quantizing diffusion models, prepare the calibration dataset:
+
+```bash
+python -m deepcompressor.app.diffusion.dataset.collect.calib \
+    configs/model/flux.1-schnell.yaml configs/collect/qdiff.yaml
+```
+
+### Step 2: Model Quantization
+
+Run quantization directly (parameters are pre-configured):
+
+```bash
+python -m deepcompressor.app.diffusion.ptq
+```
+
+> **Note**: When quantizing **Qwen-Image** models, you **must** use the `examples/diffusion/configs/svdquant/gptq.yaml` configuration. Without GPTQ, the `AWQW4A16Linear` layers will suffer significant precision loss, severely degrading image generation quality.
+
+For more detailed configurations, please refer to [examples/diffusion](/examples/diffusion/).
+
 ## News
 - [2025/02] 🎉 [**QServe**](https://arxiv.org/abs/2405.04532) has been accepted to MLSys 2025!
 - [2025/01] 🎉 [**SVDQuant**](https://arxiv.org/abs/2411.05007) has been accepted to ICLR 2025 (Spotlight)!
