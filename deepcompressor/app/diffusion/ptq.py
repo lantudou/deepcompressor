@@ -140,7 +140,6 @@ def ptq(  # noqa: C901
         if save_path:
             if not copy_on_save and load_from:
                 logger.info(f"- Linking smooth scales to {save_path.smooth}")
-                os.symlink(os.path.relpath(load_from, save_dirpath), save_path.smooth)
             else:
                 logger.info(f"- Saving smooth scales to {save_path.smooth}")
                 torch.save(smooth_cache, save_path.smooth)
@@ -418,7 +417,6 @@ def main(config: DiffusionPtqRunConfig, logging_level: int = tools.logging.DEBUG
                 num_inference_steps=50,
                 true_cfg_scale=4.0,
                 generator=generator,
-                target_seq_len=target_seq_len,  # Use the configurable parameter
             ).images[0]
             image.save("qwen-image-test.png")
     else:
@@ -435,9 +433,10 @@ def main(config: DiffusionPtqRunConfig, logging_level: int = tools.logging.DEBUG
 
 if __name__ == "__main__":
     parser = DiffusionPtqRunConfig.get_parser()
-    config, _, unused_cfgs, unused_args, unknown_args = parser.parse_known_args(["examples/diffusion/configs/model/qwenimage.yaml", "examples/diffusion/configs/svdquant/int4.yaml", "examples/diffusion/configs/svdquant/fast.yaml", "examples/diffusion/configs/svdquant/gptq.yaml"])
+    config, _, unused_cfgs, unused_args, unknown_args = parser.parse_known_args(["examples/diffusion/configs/model/qwenimage.yaml", "examples/diffusion/configs/svdquant/int4.yaml", "examples/diffusion/configs/svdquant/gptq.yaml"])
     config.skip_eval = True
     config.save_model =  "./qwen-image1/"
+    config.copy_on_save = True
     assert isinstance(config, DiffusionPtqRunConfig)
     if len(unused_cfgs) > 0:
         tools.logging.warning(f"Unused configurations: {unused_cfgs}")
