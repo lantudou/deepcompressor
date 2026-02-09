@@ -207,6 +207,22 @@ python -m deepcompressor.backend.nunchaku.convert \
   --model-name MODEL_NAME
 ```
 
+#### Step 4: Quantized Inference with Nunchaku
+
+Use the [nunchaku add-wan2-only branch](https://github.com/lantudou/nunchaku/tree/add-wan2-only) to run quantized inference:
+
+```python
+from nunchaku.models.transformers import NunchakuWanTransformer3DModel
+
+quantized_transformer = NunchakuWanTransformer3DModel.from_pretrained(
+    "path/to/wan2.2_merged.safetensors",
+    device="cuda",
+    torch_dtype=torch.bfloat16,
+)
+```
+
+See [tests/test_wan_i2v_inference.py](https://github.com/lantudou/nunchaku/blob/add-wan2-only/tests/test_wan_i2v_inference.py) for full usage.
+
 > **Note:** Since Wan2.2 I2V uses a two-stage architecture, you must complete all steps for **both** the high-noise and low-noise models to get a fully quantized pipeline.
 
 ## Reference
