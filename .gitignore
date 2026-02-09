@@ -173,3 +173,9 @@ runs/
 exps/
 wandb
 wandb/
+
+# OpenSpec / Claude
+openspec/
+AGENTS.md
+CLAUDE.md
+.claude/
